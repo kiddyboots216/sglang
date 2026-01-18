@@ -32,6 +32,8 @@ from sglang.srt.managers.io_struct import (
     BatchStrOutput,
     BatchTokenIDOutput,
     FreezeGCReq,
+    WeightUpdatePauseReq,
+    WeightUpdateResumeReq,
 )
 from sglang.srt.managers.multi_tokenizer_mixin import MultiHttpWorkerDetokenizerMixin
 from sglang.srt.metrics.cpu_monitor import start_cpu_monitor_thread
@@ -120,6 +122,9 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         self.is_tool_call_parser_gpt_oss = server_args.tool_call_parser == "gpt-oss"
         self.disable_tokenizer_batch_decode = server_args.disable_tokenizer_batch_decode
 
+        # Track weight update pause state
+        self._weight_update_paused = False
+
         self.soft_watchdog = Watchdog.create(
             debug_name="DetokenizerManager",
             watchdog_timeout=server_args.soft_watchdog_timeout,
@@ -134,6 +139,8 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                 (BatchTokenIDOutput, self.handle_batch_token_id_out),
                 (BatchMultimodalDecodeReq, self.handle_multimodal_decode_req),
                 (FreezeGCReq, self.handle_freeze_gc_req),
+                (WeightUpdatePauseReq, self._handle_weight_update_pause),
+                (WeightUpdateResumeReq, self._handle_weight_update_resume),
             ]
         )
 
@@ -391,6 +398,18 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
 
     def handle_multimodal_decode_req(self, recv_obj: BatchMultimodalDecodeReq):
         raise NotImplementedError()
+
+    def _handle_weight_update_pause(self, req: WeightUpdatePauseReq):
+        """Handle weight update pause signal from scheduler."""
+        self._weight_update_paused = True
+        self.soft_watchdog.pause()  # Disable watchdog monitoring
+        return None  # No response needed
+
+    def _handle_weight_update_resume(self, req: WeightUpdateResumeReq):
+        """Handle weight update resume signal from scheduler."""
+        self._weight_update_paused = False
+        self.soft_watchdog.resume()  # Re-enable watchdog monitoring
+        return None  # No response needed
 
     def handle_freeze_gc_req(self, recv_req: FreezeGCReq):
         freeze_gc("Detokenizer Manager")

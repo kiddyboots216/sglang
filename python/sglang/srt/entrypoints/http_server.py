@@ -95,6 +95,7 @@ from sglang.srt.managers.io_struct import (
     AbortReq,
     CheckWeightsReqInput,
     CloseSessionReqInput,
+    CompleteWeightsUpdateReqInput,
     ConfigureLoggingReq,
     ContinueGenerationReqInput,
     DestroyWeightsUpdateGroupReqInput,
@@ -108,7 +109,9 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqInput,
     ParseFunctionCallReq,
     PauseGenerationReqInput,
+    PrepareWeightsUpdateReqInput,
     ProfileReqInput,
+    ReceiveWeightsReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
     SendWeightsToRemoteInstanceReqInput,
@@ -458,6 +461,10 @@ async def health_generate(request: Request) -> Response:
     If the server is running something, this request will be ignored, so it creates zero overhead.
     If the server is not running anything, this request will be run, so we know whether the server is healthy.
     """
+
+    # Skip health check during weight updates - server is intentionally busy with NCCL operations
+    if getattr(_global_state.tokenizer_manager, "_weight_update_in_progress", False):
+        return Response(status_code=200)
 
     if _global_state.tokenizer_manager.gracefully_exit:
         logger.info("Health check request received during shutdown. Returning 503.")
@@ -961,6 +968,77 @@ async def update_weights_from_distributed(
         await _global_state.tokenizer_manager.update_weights_from_distributed(
             obj, request
         )
+    )
+
+    content = {"success": success, "message": message}
+    if success:
+        return ORJSONResponse(content, status_code=200)
+    else:
+        return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
+
+
+@app.post("/prepare_weights_update")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def prepare_weights_update(
+    obj: PrepareWeightsUpdateReqInput, request: Request
+):
+    """Phase 1 of two-phase weight update protocol.
+
+    This starts background recv threads that are ready to receive NCCL broadcasts.
+    The caller should wait for this to return before starting the NCCL broadcast.
+
+    Usage:
+        1. Call /prepare_weights_update to start recv threads (this endpoint)
+        2. Perform NCCL broadcast from the training side
+        3. Call /complete_weights_update to apply the received weights
+    """
+    success, message = (
+        await _global_state.tokenizer_manager.prepare_weights_update(obj, request)
+    )
+
+    if success:
+        content = {"status": "ready", "success": success, "message": message}
+        return ORJSONResponse(content, status_code=200)
+    else:
+        content = {"status": "error", "success": success, "message": message}
+        return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
+
+
+@app.post("/complete_weights_update")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def complete_weights_update(
+    obj: CompleteWeightsUpdateReqInput, request: Request
+):
+    """Phase 2 of two-phase weight update protocol.
+
+    This waits for the background recv threads to complete and applies the weights.
+    Should be called after the NCCL broadcast has completed on the sender side.
+    """
+    success, message = (
+        await _global_state.tokenizer_manager.complete_weights_update(obj, request)
+    )
+
+    content = {"success": success, "message": message}
+    if success:
+        return ORJSONResponse(content, status_code=200)
+    else:
+        return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
+
+
+@app.post("/receive_weights")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def receive_weights(obj: ReceiveWeightsReqInput, request: Request):
+    """Receive weights via NCCL broadcast from an existing process group.
+
+    This endpoint is used as part of the pause/broadcast/resume weight sync protocol:
+    1. Call /pause_generation to pause inference
+    2. Call /receive_weights to start NCCL recv and apply weights (this endpoint)
+    3. Call /continue_generation to resume inference
+
+    The NCCL group must already be initialized via /init_weights_update_group.
+    """
+    success, message = await _global_state.tokenizer_manager.receive_weights(
+        obj, request
     )
 
     content = {"success": success, "message": message}

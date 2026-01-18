@@ -15,12 +15,18 @@ from sglang.srt.constants import (
 from sglang.srt.managers.io_struct import (
     CheckWeightsReqInput,
     CheckWeightsReqOutput,
+    CompleteWeightsUpdateReqInput,
+    CompleteWeightsUpdateReqOutput,
     DestroyWeightsUpdateGroupReqInput,
     DestroyWeightsUpdateGroupReqOutput,
     GetWeightsByNameReqInput,
     GetWeightsByNameReqOutput,
     InitWeightsUpdateGroupReqInput,
     InitWeightsUpdateGroupReqOutput,
+    PrepareWeightsUpdateReqInput,
+    PrepareWeightsUpdateReqOutput,
+    ReceiveWeightsReqInput,
+    ReceiveWeightsReqOutput,
     ReleaseMemoryOccupationReqInput,
     ReleaseMemoryOccupationReqOutput,
     ResumeMemoryOccupationReqInput,
@@ -33,6 +39,8 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromIPCReqOutput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
+    WeightUpdatePauseReq,
+    WeightUpdateResumeReq,
 )
 
 if TYPE_CHECKING:
@@ -60,7 +68,15 @@ class SchedulerUpdateWeightsMixin:
         self: Scheduler, recv_req: InitWeightsUpdateGroupReqInput
     ):
         """Initialize the online model parameter update group."""
-        success, message = self.tp_worker.init_weights_update_group(recv_req)
+        # Notify detokenizer before blocking NCCL operation
+        self.send_to_detokenizer.send_output(WeightUpdatePauseReq(), recv_req)
+
+        try:
+            success, message = self.tp_worker.init_weights_update_group(recv_req)
+        finally:
+            # Notify detokenizer after NCCL operation completes
+            self.send_to_detokenizer.send_output(WeightUpdateResumeReq(), recv_req)
+
         return InitWeightsUpdateGroupReqOutput(success, message)
 
     def destroy_weights_update_group(
@@ -83,6 +99,77 @@ class SchedulerUpdateWeightsMixin:
         else:
             logger.error(message)
         return UpdateWeightsFromDistributedReqOutput(success, message)
+
+    def prepare_weights_update(
+        self: Scheduler,
+        recv_req: PrepareWeightsUpdateReqInput,
+    ) -> PrepareWeightsUpdateReqOutput:
+        """Phase 1 of two-phase weight update protocol.
+
+        This starts background recv threads that are ready to receive NCCL broadcasts.
+        Returns immediately once the recv threads are started and ready.
+        """
+        # Notify detokenizer before starting the weight update operation
+        self.send_to_detokenizer.send_output(WeightUpdatePauseReq(), recv_req)
+
+        try:
+            success, message = self.tp_worker.prepare_weights_update(recv_req)
+        except Exception as e:
+            # If preparation fails, resume detokenizer
+            self.send_to_detokenizer.send_output(WeightUpdateResumeReq(), recv_req)
+            logger.error(f"Failed to prepare weights update: {e}")
+            return PrepareWeightsUpdateReqOutput(success=False, message=str(e))
+
+        if not success:
+            # If preparation fails, resume detokenizer
+            self.send_to_detokenizer.send_output(WeightUpdateResumeReq(), recv_req)
+            logger.error(message)
+
+        return PrepareWeightsUpdateReqOutput(success=success, message=message)
+
+    def complete_weights_update(
+        self: Scheduler,
+        recv_req: CompleteWeightsUpdateReqInput,
+    ) -> CompleteWeightsUpdateReqOutput:
+        """Phase 2 of two-phase weight update protocol.
+
+        This waits for the background recv threads to complete and applies the weights.
+        """
+        try:
+            success, message = self.tp_worker.complete_weights_update(recv_req)
+            if success:
+                if recv_req.flush_cache:
+                    flush_cache_success = self.flush_cache()
+                    assert (
+                        flush_cache_success
+                    ), "Cache flush failed after updating weights"
+            else:
+                logger.error(message)
+        finally:
+            # Notify detokenizer after weight update operation completes
+            self.send_to_detokenizer.send_output(WeightUpdateResumeReq(), recv_req)
+
+        return CompleteWeightsUpdateReqOutput(success=success, message=message)
+
+    def receive_weights(
+        self: Scheduler,
+        recv_req: ReceiveWeightsReqInput,
+    ) -> ReceiveWeightsReqOutput:
+        """Receive weights via NCCL broadcast from an existing process group.
+
+        This is used as part of the pause/broadcast/resume weight sync protocol.
+        Assumes inference is already paused and NCCL group is initialized.
+        """
+        try:
+            success, message = self.tp_worker.receive_weights(recv_req)
+            if success and recv_req.flush_cache:
+                flush_cache_success = self.flush_cache()
+                assert flush_cache_success, "Cache flush failed after receiving weights"
+        except Exception as e:
+            logger.error(f"receive_weights failed: {e}")
+            return ReceiveWeightsReqOutput(success=False, message=str(e))
+
+        return ReceiveWeightsReqOutput(success=success, message=message)
 
     def update_weights_from_tensor(
         self: Scheduler, recv_req: UpdateWeightsFromTensorReqInput

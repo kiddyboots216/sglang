@@ -100,7 +100,9 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqInput,
     OpenSessionReqOutput,
     PauseGenerationReqInput,
+    PrepareWeightsUpdateReqInput,
     ProfileReq,
+    ReceiveWeightsReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
     RpcReqInput,
@@ -119,6 +121,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
+    CompleteWeightsUpdateReqInput,
 )
 from sglang.srt.managers.mm_utils import init_mm_embedding_cache
 from sglang.srt.managers.overlap_utils import FutureMap
@@ -1030,6 +1033,9 @@ class Scheduler(
                     UpdateWeightsFromDistributedReqInput,
                     self.update_weights_from_distributed,
                 ),
+                (PrepareWeightsUpdateReqInput, self.prepare_weights_update),
+                (CompleteWeightsUpdateReqInput, self.complete_weights_update),
+                (ReceiveWeightsReqInput, self.receive_weights),
                 (UpdateWeightsFromTensorReqInput, self.update_weights_from_tensor),
                 (UpdateWeightsFromIPCReqInput, self.update_weights_from_ipc),
                 (GetWeightsByNameReqInput, self.get_weights_by_name),

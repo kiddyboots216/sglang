@@ -396,6 +396,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # For weight updates
         self._model_update_group = {}
         self._weights_send_group = {}
+        # For two-phase weight update protocol
+        self._pending_weight_update_thread = None
+        self._pending_weight_update_result = None
+        self._pending_weight_update_weights = None
+        self._pending_weight_update_lock = threading.Lock()
+        # Event to signal when recv thread is ready to receive NCCL broadcasts
+        self._pending_weight_update_ready_event = None
 
     def init_mindspore_runner(self):
         # Init the mindspore runner
@@ -1206,18 +1213,41 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         rank = rank_offset + self.tp_rank
 
+        # Get device info for debugging
+        import os
+        cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "not set")
+        current_device = torch.cuda.current_device() if torch.cuda.is_available() else "N/A"
+
         logger.info(
             f"init custom process group: master_address={master_address}, master_port={master_port}, "
             f"rank_offset={rank_offset}, rank={rank}, world_size={world_size}, group_name={group_name}, backend={backend}"
         )
+        logger.info(
+            f"Device info: self.device={self.device}, self.gpu_id={self.gpu_id}, "
+            f"CUDA_VISIBLE_DEVICES={cuda_visible}, current_cuda_device={current_device}"
+        )
 
         try:
+            # Match Tomni's NCCL settings for cross-process communication
+            os.environ["NCCL_CUMEM_ENABLE"] = "0"
+
+            # CRITICAL: Set CUDA device before NCCL process group creation
+            # NCCL needs the correct device context to initialize properly
+            if self.device == "cuda":
+                torch.cuda.set_device(self.gpu_id)
+                logger.info(f"Set CUDA device to {self.gpu_id} before process group creation")
+
+            # Pass device_id to help NCCL identify the correct GPU
+            device_id = torch.device(f"cuda:{self.gpu_id}") if self.device == "cuda" else None
+            logger.info(f"Creating process group with device_id={device_id}, NCCL_CUMEM_ENABLE=0")
+
             self._model_update_group[group_name] = init_custom_process_group(
                 backend=backend,
                 init_method=f"tcp://{master_address}:{master_port}",
                 world_size=world_size,
                 rank=rank,
                 group_name=group_name,
+                device_id=device_id,
             )
             return True, "Succeeded to initialize custom process group."
         except Exception as e:
@@ -1326,6 +1356,420 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 f"Please discard the whole weights."
             )
             logger.error(error_msg)
+            return False, error_msg
+
+    def prepare_weights_update(
+        self,
+        buckets,
+        group_name,
+        load_format: Optional[str] = None,
+    ):
+        """Phase 1 of two-phase weight update protocol.
+
+        This starts background recv threads that are ready to receive NCCL broadcasts.
+        Returns only AFTER the recv thread has entered the NCCL broadcast call,
+        ensuring it's actually ready to receive.
+
+        This method is designed to fix race conditions in RL training pipelines where
+        the training side (e.g., Slime) starts NCCL broadcasts before SGLang's recv
+        is ready.
+
+        Args:
+            buckets: List of WeightBucket objects, each containing names, dtypes, shapes
+            group_name: NCCL group name
+            load_format: Optional format specification for loading
+
+        Usage:
+            1. Call prepare_weights_update() - starts background recv threads
+            2. Perform NCCL broadcast from training side
+            3. Call complete_weights_update() - waits for recv and applies weights
+        """
+        assert group_name in self._model_update_group, (
+            f"Group {group_name} not in {list(self._model_update_group.keys())}. "
+            "Please call `init_weights_update_group` first."
+        )
+
+        with self._pending_weight_update_lock:
+            if self._pending_weight_update_thread is not None:
+                return (
+                    False,
+                    "A weight update is already in progress. "
+                    "Call complete_weights_update first.",
+                )
+
+            # Reset state
+            self._pending_weight_update_result = None
+            self._pending_weight_update_weights = None
+
+            num_buckets = len(buckets)
+            logger.info(
+                f"Starting weight update with {num_buckets} bucket(s) "
+                f"on group {group_name}"
+            )
+
+            # Create event for the background thread to signal when it's ready
+            self._pending_weight_update_ready_event = threading.Event()
+
+            # Start background thread to receive weights
+            self._pending_weight_update_thread = threading.Thread(
+                target=self._recv_weights_background,
+                args=(buckets, group_name, load_format),
+                daemon=True,
+            )
+            self._pending_weight_update_thread.start()
+
+        # Wait for the background thread to signal it's ready to receive
+        # This ensures NCCL recv is actually waiting before we return "ready"
+        ready_timeout = 60  # seconds
+        if not self._pending_weight_update_ready_event.wait(timeout=ready_timeout):
+            logger.error(
+                f"Background recv thread did not become ready within {ready_timeout}s"
+            )
+            return (
+                False,
+                f"Timeout waiting for recv thread to become ready after {ready_timeout}s",
+            )
+
+        logger.info(
+            f"Weight update recv thread is now waiting for NCCL broadcasts "
+            f"({num_buckets} bucket(s))"
+        )
+
+        return (
+            True,
+            f"Weight update recv threads started for {num_buckets} bucket(s). "
+            "Ready to receive broadcasts.",
+        )
+
+    def _recv_weights_background(
+        self,
+        buckets,
+        group_name,
+        load_format: Optional[str] = None,
+    ):
+        """Background thread that receives weights via NCCL broadcast.
+
+        This runs in a separate thread so that the main scheduler event loop
+        can return immediately after prepare_weights_update.
+
+        Args:
+            buckets: List of WeightBucket objects
+            group_name: NCCL group name
+            load_format: Optional format specification
+        """
+        try:
+            all_weights = []
+            is_first_bucket = True
+
+            # Process each bucket - one NCCL broadcast per bucket
+            for bucket_idx, bucket in enumerate(buckets):
+                names = bucket.names
+                dtypes = bucket.dtypes
+                shapes = bucket.shapes
+
+                logger.debug(
+                    f"Receiving bucket {bucket_idx + 1}/{len(buckets)} "
+                    f"with {len(names)} weights"
+                )
+
+                if load_format == "flattened_bucket":
+                    # Receive as flattened bucket (single broadcast per bucket)
+                    bucket_weights = self._recv_single_bucket_flattened(
+                        names,
+                        dtypes,
+                        shapes,
+                        group_name,
+                        signal_ready=is_first_bucket,
+                    )
+                else:
+                    # Receive individual weights (one broadcast per weight)
+                    bucket_weights = self._recv_single_bucket_individual(
+                        names,
+                        dtypes,
+                        shapes,
+                        group_name,
+                        signal_ready=is_first_bucket,
+                    )
+
+                is_first_bucket = False
+                all_weights.extend(bucket_weights)
+
+            with self._pending_weight_update_lock:
+                self._pending_weight_update_weights = all_weights
+                self._pending_weight_update_result = (
+                    True,
+                    f"Received {len(all_weights)} weights from {len(buckets)} bucket(s).",
+                )
+
+        except Exception as e:
+            error_msg = f"Failed to receive weights in background: {e}"
+            logger.error(error_msg)
+            # Make sure we signal ready even on error so prepare_weights_update doesn't hang
+            if self._pending_weight_update_ready_event is not None:
+                self._pending_weight_update_ready_event.set()
+            with self._pending_weight_update_lock:
+                self._pending_weight_update_result = (False, error_msg)
+
+    def _recv_single_bucket_flattened(
+        self, names, dtypes, shapes, group_name, signal_ready=False
+    ):
+        """Receive a single bucket as a flattened tensor."""
+        # Use explicit device based on gpu_id for NCCL compatibility
+        explicit_device = f"cuda:{self.gpu_id}" if self.device == "cuda" else self.device
+        named_tensors = []
+        for name, dtype, shape in zip(names, dtypes, shapes):
+            target_dtype = (
+                dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
+            )
+            named_tensors.append(
+                (name, torch.empty(shape, dtype=target_dtype, device=explicit_device))
+            )
+
+        bucket = FlattenedTensorBucket(named_tensors=named_tensors)
+        flattened_tensor = bucket.get_flattened_tensor()
+
+        # Signal ready BEFORE entering the blocking NCCL broadcast
+        # This tells the caller we're about to wait for the broadcast
+        if signal_ready and self._pending_weight_update_ready_event is not None:
+            # First, barrier across all TP ranks to ensure they're all ready
+            # This prevents returning "ready" before all TP ranks are waiting
+            # NOTE: Use cpu_group for barrier, NOT device_group! NCCL barrier
+            # creates internal GPU tensors which can mess up device context.
+            tp_group = get_tp_group()
+            if tp_group is not None and tp_group.world_size > 1:
+                logger.info(
+                    f"TP rank {tp_group.rank} waiting at barrier before signaling ready"
+                )
+                torch.distributed.barrier(group=tp_group.cpu_group)
+                logger.info(f"TP rank {tp_group.rank} passed barrier")
+
+            logger.info("Signaling ready before NCCL broadcast (flattened bucket)")
+            self._pending_weight_update_ready_event.set()
+
+        torch.distributed.broadcast(
+            flattened_tensor,
+            src=0,
+            group=self._model_update_group[group_name],
+        )
+        return bucket.reconstruct_tensors()
+
+    def _recv_single_bucket_individual(
+        self, names, dtypes, shapes, group_name, signal_ready=False
+    ):
+        """Receive a single bucket with individual broadcasts per weight."""
+        weights = []
+        handles = []
+
+        # Allocate all tensors first
+        # Use explicit device based on gpu_id for NCCL compatibility
+        explicit_device = f"cuda:{self.gpu_id}" if self.device == "cuda" else self.device
+        for name, dtype, shape in zip(names, dtypes, shapes):
+            target_dtype = (
+                dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
+            )
+            weight = torch.empty(shape, dtype=target_dtype, device=explicit_device)
+            weights.append((name, weight))
+
+        # Signal ready BEFORE entering the blocking NCCL broadcasts
+        # This tells the caller we're about to wait for the broadcasts
+        if signal_ready and self._pending_weight_update_ready_event is not None:
+            # First, barrier across all TP ranks to ensure they're all ready
+            # This prevents returning "ready" before all TP ranks are waiting
+            # NOTE: Use cpu_group for barrier, NOT device_group! NCCL barrier
+            # creates internal GPU tensors which can mess up device context.
+            tp_group = get_tp_group()
+            if tp_group is not None and tp_group.world_size > 1:
+                logger.info(
+                    f"TP rank {tp_group.rank} waiting at barrier before signaling ready"
+                )
+                torch.distributed.barrier(group=tp_group.cpu_group)
+                logger.info(f"TP rank {tp_group.rank} passed barrier")
+
+            logger.info("Signaling ready before NCCL broadcast (individual)")
+            self._pending_weight_update_ready_event.set()
+
+        # Debug logging for NCCL broadcast
+        import os
+        cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "not set")
+        current_device = torch.cuda.current_device() if torch.cuda.is_available() else "N/A"
+        logger.info(
+            f"Starting NCCL broadcasts: self.device={self.device}, self.gpu_id={self.gpu_id}, "
+            f"CUDA_VISIBLE_DEVICES={cuda_visible}, current_cuda_device={current_device}, "
+            f"num_weights={len(weights)}, first_weight_device={weights[0][1].device if weights else 'N/A'}"
+        )
+
+        # Ensure we're on the correct CUDA device before NCCL operations
+        if self.device == "cuda":
+            torch.cuda.set_device(self.gpu_id)
+            logger.info(f"Set CUDA device to {self.gpu_id} before NCCL broadcast")
+
+        # Now start all broadcasts
+        for name, weight in weights:
+            handles.append(
+                torch.distributed.broadcast(
+                    weight,
+                    src=0,
+                    group=self._model_update_group[group_name],
+                    async_op=True,
+                )
+            )
+
+        # Wait for all broadcasts in this bucket to complete
+        for handle in handles:
+            handle.wait()
+
+        return weights
+
+    def complete_weights_update(self, group_name):
+        """Phase 2 of two-phase weight update protocol.
+
+        This waits for the background recv threads to complete and applies the weights.
+        Should be called after the NCCL broadcast has completed on the sender side.
+
+        Args:
+            group_name: The NCCL group name (for validation)
+
+        Returns:
+            Tuple[bool, str]: (success, message)
+        """
+        # Default timeout of 300 seconds for the recv thread to complete
+        timeout = 300
+
+        with self._pending_weight_update_lock:
+            if self._pending_weight_update_thread is None:
+                return (
+                    False,
+                    "No weight update in progress. Call prepare_weights_update first.",
+                )
+            thread = self._pending_weight_update_thread
+
+        # Wait for the background thread to complete
+        thread.join(timeout=timeout)
+
+        with self._pending_weight_update_lock:
+            if thread.is_alive():
+                # Thread timed out
+                error_msg = (
+                    f"Weight update timed out after {timeout}s. "
+                    "The NCCL broadcast may not have been initiated by the sender."
+                )
+                logger.error(error_msg)
+                # Reset state - thread will eventually die or complete
+                self._pending_weight_update_thread = None
+                self._pending_weight_update_result = None
+                self._pending_weight_update_weights = None
+                return False, error_msg
+
+            # Get the result
+            result = self._pending_weight_update_result
+            weights = self._pending_weight_update_weights
+
+            # Reset state
+            self._pending_weight_update_thread = None
+            self._pending_weight_update_result = None
+            self._pending_weight_update_weights = None
+
+        if result is None:
+            return False, "Weight update failed: no result available."
+
+        success, message = result
+        if not success:
+            return success, message
+
+        # Apply the received weights
+        try:
+            self.model.load_weights(weights)
+            return True, "Succeeded to update weights via two-phase protocol."
+        except Exception as e:
+            error_msg = (
+                f"Failed to load weights: {e}. "
+                f"The weights were received but could not be applied."
+            )
+            logger.error(error_msg)
+            return False, error_msg
+
+    def receive_weights(
+        self,
+        num_buckets: int,
+        buckets: list,
+        group_name: str = "weight_update_group",
+        flush_cache: bool = False,
+    ):
+        """Receive weights via NCCL broadcast from an existing process group.
+
+        This is the main method for the pause/broadcast/resume weight sync protocol.
+        It receives weights synchronously via NCCL broadcast and applies them.
+
+        Args:
+            num_buckets: Number of weight buckets to receive
+            buckets: List of bucket metadata dicts with 'names', 'dtypes', 'shapes'
+            group_name: The NCCL group name (must already be initialized)
+            flush_cache: Whether to flush KV cache after applying weights
+
+        Returns:
+            Tuple[bool, str]: (success, message)
+        """
+        logger.info(f"receive_weights: receiving {num_buckets} buckets via group '{group_name}'")
+
+        # Get the NCCL group
+        if group_name not in self._model_update_group:
+            error_msg = f"NCCL group '{group_name}' not found. Call init_weights_update_group first."
+            logger.error(error_msg)
+            return False, error_msg
+
+        group = self._model_update_group[group_name]
+
+        # Map dtype strings to torch dtypes
+        dtype_map = {
+            "float32": torch.float32,
+            "float16": torch.float16,
+            "bfloat16": torch.bfloat16,
+            "int8": torch.int8,
+            "int32": torch.int32,
+            "int64": torch.int64,
+        }
+
+        all_weights = []
+
+        try:
+            # Receive each bucket
+            for bucket_idx, bucket in enumerate(buckets):
+                names = bucket["names"]
+                dtypes = bucket["dtypes"]
+                shapes = bucket["shapes"]
+
+                logger.info(
+                    f"receive_weights: receiving bucket {bucket_idx+1}/{num_buckets} "
+                    f"({len(names)} params)"
+                )
+
+                # Receive each weight in the bucket
+                for name, dtype_str, shape in zip(names, dtypes, shapes):
+                    dtype = dtype_map.get(dtype_str)
+                    if dtype is None:
+                        error_msg = f"Unknown dtype: {dtype_str}"
+                        logger.error(error_msg)
+                        return False, error_msg
+
+                    # Allocate receive buffer
+                    recv_buffer = torch.empty(shape, dtype=dtype, device=self.device)
+
+                    # NCCL broadcast recv (src=0 is training)
+                    torch.distributed.broadcast(recv_buffer, src=0, group=group)
+
+                    all_weights.append((name, recv_buffer))
+
+            logger.info(f"receive_weights: received {len(all_weights)} weights, applying to model")
+
+            # Apply the received weights
+            self.model.load_weights(all_weights)
+
+            logger.info("receive_weights: weights applied successfully")
+            return True, f"Received and applied {len(all_weights)} weights"
+
+        except Exception as e:
+            error_msg = f"Failed to receive weights: {e}"
+            logger.error(error_msg, exc_info=True)
             return False, error_msg
 
     def update_weights_from_tensor(

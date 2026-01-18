@@ -391,6 +391,9 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         self.is_pause = False
         self.is_pause_cond = asyncio.Condition()
 
+        # Flag to track when weight updates are in progress (for health check skipping)
+        self._weight_update_in_progress: bool = False
+
     def init_lora(self):
         # LoRA
         # Initialize the `LoRARegistry` with initial LoRA adapter paths provided in `server_args`.

@@ -1243,6 +1243,86 @@ class UpdateWeightsFromDistributedReqOutput(BaseReq):
 
 
 @dataclass
+class WeightBucket:
+    """A single bucket of weights for batched weight updates."""
+
+    names: List[str]
+    dtypes: List[str]
+    shapes: List[List[int]]
+
+
+@dataclass
+class PrepareWeightsUpdateReqInput(BaseReq):
+    """Phase 1 of two-phase weight update protocol.
+
+    This starts background recv threads that are ready to receive NCCL broadcasts.
+    The caller should wait for this to return before starting the NCCL broadcast.
+
+    Supports two formats:
+    1. Batched format (preferred): buckets array with num_buckets
+    2. Flat format (legacy): names, dtypes, shapes at top level
+    """
+
+    # Batched format - array of buckets
+    buckets: Optional[List[WeightBucket]] = None
+    num_buckets: Optional[int] = None
+
+    # Flat format (legacy) - single set of weights
+    names: Optional[List[str]] = None
+    dtypes: Optional[List[str]] = None
+    shapes: Optional[List[List[int]]] = None
+
+    # The group name
+    group_name: str = "weight_update_group"
+    # Optional format specification for loading
+    load_format: Optional[str] = None
+
+    def get_buckets(self) -> List[WeightBucket]:
+        """Return buckets in a normalized format."""
+        if self.buckets is not None:
+            return self.buckets
+        elif self.names is not None:
+            # Convert flat format to single bucket
+            return [
+                WeightBucket(
+                    names=self.names, dtypes=self.dtypes, shapes=self.shapes
+                )
+            ]
+        else:
+            raise ValueError(
+                "PrepareWeightsUpdateReqInput must have either 'buckets' or 'names/dtypes/shapes'"
+            )
+
+
+@dataclass
+class PrepareWeightsUpdateReqOutput(BaseReq):
+    success: bool
+    message: str
+
+
+@dataclass
+class CompleteWeightsUpdateReqInput(BaseReq):
+    """Phase 2 of two-phase weight update protocol.
+
+    This waits for the background recv threads to complete and applies the weights.
+    Should be called after the NCCL broadcast has completed on the sender side.
+    """
+
+    # The group name (must match the one used in prepare)
+    group_name: str = "weight_update_group"
+    # Whether to flush the cache after updating weights
+    flush_cache: bool = True
+    # Optional: Update weight version along with weights
+    weight_version: Optional[str] = None
+
+
+@dataclass
+class CompleteWeightsUpdateReqOutput(BaseReq):
+    success: bool
+    message: str
+
+
+@dataclass
 class UpdateWeightsFromTensorReqInput(BaseReq):
     """Update model weights from tensor input.
 
@@ -1263,6 +1343,30 @@ class UpdateWeightsFromTensorReqInput(BaseReq):
 
 @dataclass
 class UpdateWeightsFromTensorReqOutput(BaseReq):
+    success: bool
+    message: str
+
+
+@dataclass
+class ReceiveWeightsReqInput(BaseReq):
+    """Request to receive weights via NCCL broadcast from an existing process group.
+
+    This is used after pause_generation to receive new weights from the training server.
+    The NCCL group must already be initialized via init_weights_update_group.
+    """
+
+    # Number of buckets of weights to receive
+    num_buckets: int
+    # Bucket metadata - list of dicts with 'names', 'dtypes', 'shapes'
+    buckets: List[Dict[str, Any]]
+    # The NCCL group name (must match the one used in init_weights_update_group)
+    group_name: str = "weight_update_group"
+    # Whether to flush KV cache after applying weights
+    flush_cache: bool = False
+
+
+@dataclass
+class ReceiveWeightsReqOutput(BaseReq):
     success: bool
     message: str
 
@@ -1354,6 +1458,20 @@ class DestroyWeightsUpdateGroupReqInput(BaseReq):
 class DestroyWeightsUpdateGroupReqOutput(BaseReq):
     success: bool
     message: str
+
+
+@dataclass
+class WeightUpdatePauseReq(BaseReq):
+    """Signal to detokenizer that a blocking weight update operation is starting."""
+
+    pass
+
+
+@dataclass
+class WeightUpdateResumeReq(BaseReq):
+    """Signal to detokenizer that a blocking weight update operation has completed."""
+
+    pass
 
 
 @dataclass
