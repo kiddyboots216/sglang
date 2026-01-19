@@ -91,13 +91,54 @@ class SchedulerUpdateWeightsMixin:
         recv_req: UpdateWeightsFromDistributedReqInput,
     ) -> Tuple[bool, str]:
         """Update the online model parameter."""
-        success, message = self.tp_worker.update_weights_from_distributed(recv_req)
-        if success:
-            if recv_req.flush_cache:
-                flush_cache_success = self.flush_cache()
-                assert flush_cache_success, "Cache flush failed after updating weights"
-        else:
-            logger.error(message)
+        kv_cache_freed = False
+        try:
+            # Free KV cache memory before receiving weights if requested
+            # This helps avoid OOM when the KV cache takes most of GPU memory
+            if recv_req.free_kv_cache_before_recv:
+                if not self._is_no_request():
+                    return UpdateWeightsFromDistributedReqOutput(
+                        success=False,
+                        message="Cannot free KV cache: there are pending requests. "
+                        "Call pause_generation first.",
+                    )
+                logger.info("Freeing KV cache memory before receiving weights...")
+                # Clear allocator state
+                self.flush_cache()
+                # Free the actual KV cache buffer memory
+                kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
+                kv_cache._clear_buffers()
+                torch.cuda.empty_cache()
+                kv_cache_freed = True
+                logger.info("KV cache memory freed successfully.")
+
+            success, message = self.tp_worker.update_weights_from_distributed(recv_req)
+
+            # Recreate KV cache buffers if we freed them
+            if kv_cache_freed:
+                logger.info("Recreating KV cache buffers after weight update...")
+                kv_cache._create_buffers()
+                logger.info("KV cache buffers recreated successfully.")
+
+            if success:
+                if recv_req.flush_cache:
+                    flush_cache_success = self.flush_cache()
+                    assert (
+                        flush_cache_success
+                    ), "Cache flush failed after updating weights"
+            else:
+                logger.error(message)
+        except Exception as e:
+            logger.error(f"update_weights_from_distributed failed: {e}")
+            # Try to recreate KV cache buffers if we freed them and failed
+            if kv_cache_freed:
+                try:
+                    logger.info("Attempting to recreate KV cache buffers after failure...")
+                    kv_cache._create_buffers()
+                except Exception as e2:
+                    logger.error(f"Failed to recreate KV cache buffers: {e2}")
+            return UpdateWeightsFromDistributedReqOutput(success=False, message=str(e))
+
         return UpdateWeightsFromDistributedReqOutput(success, message)
 
     def prepare_weights_update(
@@ -160,13 +201,47 @@ class SchedulerUpdateWeightsMixin:
         This is used as part of the pause/broadcast/resume weight sync protocol.
         Assumes inference is already paused and NCCL group is initialized.
         """
+        kv_cache_freed = False
         try:
+            # Free KV cache memory before receiving weights if requested
+            # This helps avoid OOM when the KV cache takes most of GPU memory
+            if recv_req.free_kv_cache_before_recv:
+                if not self._is_no_request():
+                    return ReceiveWeightsReqOutput(
+                        success=False,
+                        message="Cannot free KV cache: there are pending requests. "
+                        "Call pause_generation first.",
+                    )
+                logger.info("Freeing KV cache memory before receiving weights...")
+                # Clear allocator state
+                self.flush_cache()
+                # Free the actual KV cache buffer memory
+                kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
+                kv_cache._clear_buffers()
+                torch.cuda.empty_cache()
+                kv_cache_freed = True
+                logger.info("KV cache memory freed successfully.")
+
             success, message = self.tp_worker.receive_weights(recv_req)
+
+            # Recreate KV cache buffers if we freed them
+            if kv_cache_freed:
+                logger.info("Recreating KV cache buffers after weight update...")
+                kv_cache._create_buffers()
+                logger.info("KV cache buffers recreated successfully.")
+
             if success and recv_req.flush_cache:
                 flush_cache_success = self.flush_cache()
                 assert flush_cache_success, "Cache flush failed after receiving weights"
         except Exception as e:
             logger.error(f"receive_weights failed: {e}")
+            # Try to recreate KV cache buffers if we freed them and failed
+            if kv_cache_freed:
+                try:
+                    logger.info("Attempting to recreate KV cache buffers after failure...")
+                    kv_cache._create_buffers()
+                except Exception as e2:
+                    logger.error(f"Failed to recreate KV cache buffers: {e2}")
             return ReceiveWeightsReqOutput(success=False, message=str(e))
 
         return ReceiveWeightsReqOutput(success=success, message=message)

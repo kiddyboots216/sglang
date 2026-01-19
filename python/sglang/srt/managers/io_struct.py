@@ -1234,6 +1234,9 @@ class UpdateWeightsFromDistributedReqInput(BaseReq):
     weight_version: Optional[str] = None
     # Optional format specification for loading
     load_format: Optional[str] = None
+    # Whether to free KV cache memory before receiving weights (to avoid OOM)
+    # The KV cache buffers will be recreated after weights are received
+    free_kv_cache_before_recv: bool = False
 
 
 @dataclass
@@ -1363,6 +1366,9 @@ class ReceiveWeightsReqInput(BaseReq):
     group_name: str = "weight_update_group"
     # Whether to flush KV cache after applying weights
     flush_cache: bool = False
+    # Whether to free KV cache memory before receiving weights (to avoid OOM)
+    # The KV cache buffers will be recreated after weights are received
+    free_kv_cache_before_recv: bool = False
 
 
 @dataclass
