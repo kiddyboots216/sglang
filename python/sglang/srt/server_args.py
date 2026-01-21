@@ -642,6 +642,9 @@ class ServerArgs:
     remote_instance_weight_loader_backend: Literal["transfer_engine", "nccl"] = "nccl"
     remote_instance_weight_loader_start_seed_via_transfer_engine: bool = False
 
+    # For RDMA direct weight updates (training pushes to inference)
+    enable_rdma_weight_updates: bool = False
+
     # For PD-Multiplexing
     enable_pdmux: bool = False
     pdmux_config_path: Optional[str] = None
@@ -4584,6 +4587,11 @@ class ServerArgs:
             "--remote-instance-weight-loader-start-seed-via-transfer-engine",
             action="store_true",
             help="Start seed server via transfer engine backend for remote instance weight loader.",
+        )
+        parser.add_argument(
+            "--enable-rdma-weight-updates",
+            action="store_true",
+            help="Enable RDMA direct weight updates. When enabled, training can push weights directly to inference GPU memory via RDMA writes.",
         )
 
         # For PD-Multiplexing

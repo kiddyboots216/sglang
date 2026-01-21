@@ -15,14 +15,20 @@ from sglang.srt.constants import (
 from sglang.srt.managers.io_struct import (
     CheckWeightsReqInput,
     CheckWeightsReqOutput,
+    CompleteRDMAWeightUpdateReqInput,
+    CompleteRDMAWeightUpdateReqOutput,
     CompleteWeightsUpdateReqInput,
     CompleteWeightsUpdateReqOutput,
     DestroyWeightsUpdateGroupReqInput,
     DestroyWeightsUpdateGroupReqOutput,
+    GetRDMAWeightAddressesReqInput,
+    GetRDMAWeightAddressesReqOutput,
     GetWeightsByNameReqInput,
     GetWeightsByNameReqOutput,
     InitWeightsUpdateGroupReqInput,
     InitWeightsUpdateGroupReqOutput,
+    PrepareRDMAWeightUpdateReqInput,
+    PrepareRDMAWeightUpdateReqOutput,
     PrepareWeightsUpdateReqInput,
     PrepareWeightsUpdateReqOutput,
     ReceiveWeightsReqInput,
@@ -191,6 +197,89 @@ class SchedulerUpdateWeightsMixin:
             self.send_to_detokenizer.send_output(WeightUpdateResumeReq(), recv_req)
 
         return CompleteWeightsUpdateReqOutput(success=success, message=message)
+
+    # ========================================================================
+    # RDMA Direct Weight Update Methods
+    # ========================================================================
+
+    def get_rdma_weight_addresses(
+        self: Scheduler,
+        recv_req: GetRDMAWeightAddressesReqInput,
+    ) -> GetRDMAWeightAddressesReqOutput:
+        """Get RDMA-accessible weight addresses for direct GPU writes.
+
+        Returns weight memory addresses that can be used for RDMA PUSH model updates.
+        """
+        try:
+            result = self.tp_worker.get_rdma_weight_addresses(recv_req)
+            return GetRDMAWeightAddressesReqOutput(
+                success=result.get("success", False),
+                message=result.get("message", ""),
+                rdma_session_id=result.get("rdma_session_id", ""),
+                rdma_addr=result.get("rdma_addr", ""),
+                weights=result.get("weights", {}),
+            )
+        except Exception as e:
+            logger.error(f"get_rdma_weight_addresses failed: {e}")
+            return GetRDMAWeightAddressesReqOutput(
+                success=False,
+                message=str(e),
+                rdma_session_id="",
+                rdma_addr="",
+                weights={},
+            )
+
+    def prepare_rdma_weight_update(
+        self: Scheduler,
+        recv_req: PrepareRDMAWeightUpdateReqInput,
+    ) -> PrepareRDMAWeightUpdateReqOutput:
+        """Prepare for RDMA weight update.
+
+        This pauses inference and synchronizes CUDA to ensure weights are not being accessed.
+        """
+        # Notify detokenizer before starting the weight update operation
+        self.send_to_detokenizer.send_output(WeightUpdatePauseReq(), recv_req)
+
+        try:
+            success, message = self.tp_worker.prepare_rdma_weight_update(recv_req)
+        except Exception as e:
+            # If preparation fails, resume detokenizer
+            self.send_to_detokenizer.send_output(WeightUpdateResumeReq(), recv_req)
+            logger.error(f"Failed to prepare RDMA weight update: {e}")
+            return PrepareRDMAWeightUpdateReqOutput(
+                success=False, message=str(e), status="error"
+            )
+
+        if not success:
+            # If preparation fails, resume detokenizer
+            self.send_to_detokenizer.send_output(WeightUpdateResumeReq(), recv_req)
+            logger.error(message)
+
+        return PrepareRDMAWeightUpdateReqOutput(
+            success=success, message=message, status="ready" if success else "error"
+        )
+
+    def complete_rdma_weight_update(
+        self: Scheduler,
+        recv_req: CompleteRDMAWeightUpdateReqInput,
+    ) -> CompleteRDMAWeightUpdateReqOutput:
+        """Complete RDMA weight update.
+
+        Called after RDMA writes are done to synchronize and resume inference.
+        """
+        try:
+            success, message = self.tp_worker.complete_rdma_weight_update(recv_req)
+            if success:
+                if recv_req.flush_cache:
+                    flush_cache_success = self.flush_cache()
+                    assert flush_cache_success, "Cache flush failed after RDMA weight update"
+            else:
+                logger.error(message)
+        finally:
+            # Notify detokenizer after weight update operation completes
+            self.send_to_detokenizer.send_output(WeightUpdateResumeReq(), recv_req)
+
+        return CompleteRDMAWeightUpdateReqOutput(success=success, message=message)
 
     def receive_weights(
         self: Scheduler,

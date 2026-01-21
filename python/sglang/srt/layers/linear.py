@@ -381,6 +381,10 @@ class ColumnParallelLinear(LinearBase):
         if output_dim is not None and not use_bitsandbytes_4bit:
             shard_size = param_data.shape[output_dim]
             start_idx = self.tp_rank * shard_size
+            # DEBUG: Log TP sharding info for weight sync debugging
+            logger.info(f"[TP{self.tp_rank}] ColumnParallel.weight_loader: loaded={loaded_weight.shape}, "
+                        f"start_idx={start_idx}, shard_size={shard_size}, output_dim={output_dim}, "
+                        f"use_presharded_weights={self.use_presharded_weights}")
 
             if _is_cpu:
                 from sglang.srt.model_loader.weight_utils import (
@@ -1122,6 +1126,13 @@ class QKVParallelLinear(ColumnParallelLinear):
 
         assert loaded_shard_id in ["q", "k", "v"]
 
+        # DEBUG: Log QKV weight loading for weight sync debugging
+        logger.info(f"[TP{self.tp_rank}] QKVParallel.weight_loader: shard_id={loaded_shard_id}, "
+                    f"loaded_weight.shape={loaded_weight.shape}, param_data.shape={param_data.shape}, "
+                    f"num_heads={self.num_heads}, total_num_heads={self.total_num_heads}, "
+                    f"num_kv_heads={self.num_kv_heads}, total_num_kv_heads={self.total_num_kv_heads}, "
+                    f"head_size={self.head_size}, use_presharded={self.use_presharded_weights}")
+
         # If output dim is defined, use the default loading process.
         if output_dim is not None:
             if loaded_shard_id == "q":
@@ -1174,6 +1185,11 @@ class QKVParallelLinear(ColumnParallelLinear):
             else:
                 shard_id = self.tp_rank // self.num_kv_head_replicas
             start_idx = shard_id * shard_size
+
+            # DEBUG: Log the narrowing operation
+            logger.info(f"[TP{self.tp_rank}] QKVParallel.weight_loader: shard_offset={shard_offset}, "
+                        f"shard_size={shard_size}, shard_id={shard_id}, start_idx={start_idx}, "
+                        f"loaded_weight.shape[{output_dim}]={loaded_weight.shape[output_dim]}")
 
             if _is_cpu:
                 from sglang.srt.model_loader.weight_utils import (

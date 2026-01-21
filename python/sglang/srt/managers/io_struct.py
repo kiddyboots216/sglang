@@ -1369,6 +1369,9 @@ class ReceiveWeightsReqInput(BaseReq):
     # Whether to free KV cache memory before receiving weights (to avoid OOM)
     # The KV cache buffers will be recreated after weights are received
     free_kv_cache_before_recv: bool = False
+    # Whether to recapture CUDA graphs after weight update (default True for safety)
+    # CUDA graphs capture memory pointers - must recapture when weights change
+    recapture_cuda_graph: bool = True
 
 
 @dataclass
@@ -1985,6 +1988,90 @@ class LazyDumpTensorsReqInput(BaseReq):
 @dataclass
 class LazyDumpTensorsReqOutput(BaseReq):
     success: bool
+
+
+# ============================================================================
+# RDMA Direct Weight Update Types
+# ============================================================================
+
+
+@dataclass
+class GetRDMAWeightAddressesReqInput(BaseReq):
+    """Request to get RDMA-accessible weight addresses for direct GPU writes.
+
+    Used by training servers to get memory addresses for RDMA PUSH model weight updates.
+    """
+
+    # Optional: specific weight names to get addresses for (None = all weights)
+    weight_names: Optional[List[str]] = None
+
+
+@dataclass
+class RDMAWeightInfo:
+    """Information about a single weight tensor for RDMA access."""
+
+    data_ptr: int  # GPU memory address
+    numel: int  # Number of elements
+    element_size: int  # Size of each element in bytes
+    dtype: str  # Data type string (e.g., "bfloat16")
+    shape: List[int]  # Tensor shape
+
+
+@dataclass
+class GetRDMAWeightAddressesReqOutput(BaseReq):
+    """Response containing weight addresses for RDMA access."""
+
+    success: bool
+    message: str = ""
+    # RDMA session ID for TransferEngine handshake
+    rdma_session_id: str = ""
+    # RDMA address (host:port) for TransferEngine connection
+    rdma_addr: str = ""
+    # Weight info: {weight_name: RDMAWeightInfo}
+    # Serialized as dict for JSON compatibility
+    weights: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+
+
+@dataclass
+class PrepareRDMAWeightUpdateReqInput(BaseReq):
+    """Request to prepare for RDMA weight update.
+
+    This pauses inference and synchronizes CUDA to ensure weights are not being accessed.
+    """
+
+    # Version identifier for this weight update
+    weight_version: str = ""
+
+
+@dataclass
+class PrepareRDMAWeightUpdateReqOutput(BaseReq):
+    """Response indicating readiness for RDMA weight writes."""
+
+    success: bool
+    message: str = ""
+    # Status: "ready" when safe to perform RDMA writes
+    status: str = ""
+
+
+@dataclass
+class CompleteRDMAWeightUpdateReqInput(BaseReq):
+    """Request to complete RDMA weight update.
+
+    Called after RDMA writes are done to synchronize and resume inference.
+    """
+
+    # Whether to flush KV cache after weight update
+    flush_cache: bool = True
+    # Version identifier for this weight update
+    weight_version: str = ""
+
+
+@dataclass
+class CompleteRDMAWeightUpdateReqOutput(BaseReq):
+    """Response after completing RDMA weight update."""
+
+    success: bool
+    message: str = ""
 
 
 def _check_all_req_types():

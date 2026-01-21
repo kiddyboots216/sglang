@@ -95,12 +95,14 @@ from sglang.srt.managers.io_struct import (
     AbortReq,
     CheckWeightsReqInput,
     CloseSessionReqInput,
+    CompleteRDMAWeightUpdateReqInput,
     CompleteWeightsUpdateReqInput,
     ConfigureLoggingReq,
     ContinueGenerationReqInput,
     DestroyWeightsUpdateGroupReqInput,
     EmbeddingReqInput,
     GenerateReqInput,
+    GetRDMAWeightAddressesReqInput,
     GetWeightsByNameReqInput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsUpdateGroupReqInput,
@@ -109,6 +111,7 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqInput,
     ParseFunctionCallReq,
     PauseGenerationReqInput,
+    PrepareRDMAWeightUpdateReqInput,
     PrepareWeightsUpdateReqInput,
     ProfileReqInput,
     ReceiveWeightsReqInput,
@@ -903,6 +906,85 @@ async def get_remote_instance_transfer_engine_info(rank: int = None):
     except Exception as e:
         logger.error(f"Exception: {e}")
         return Response(status_code=HTTPStatus.BAD_REQUEST)
+
+
+@app.get("/get_rdma_weight_addresses")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def get_rdma_weight_addresses(rank: int = None):
+    """Get RDMA-accessible weight addresses for direct GPU writes.
+
+    This endpoint returns the GPU memory addresses of model weights, allowing
+    training servers to perform RDMA writes directly to inference GPU memory.
+
+    Args:
+        rank: The TP rank to get addresses for. If None, uses rank 0.
+
+    Returns:
+        JSON with RDMA session info and weight addresses.
+    """
+    if rank is None:
+        rank = 0
+    if rank < 0:
+        return Response(status_code=HTTPStatus.BAD_REQUEST)
+
+    try:
+        result = await _global_state.tokenizer_manager.get_rdma_weight_addresses(
+            GetRDMAWeightAddressesReqInput(), rank
+        )
+        return ORJSONResponse(result, status_code=200 if result.get("success", False) else HTTPStatus.BAD_REQUEST)
+    except Exception as e:
+        logger.error(f"get_rdma_weight_addresses failed: {e}")
+        return ORJSONResponse(
+            {"success": False, "message": str(e)},
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR
+        )
+
+
+@app.post("/prepare_rdma_weight_update")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def prepare_rdma_weight_update(
+    obj: PrepareRDMAWeightUpdateReqInput, request: Request
+):
+    """Prepare for RDMA weight update.
+
+    This pauses inference and synchronizes CUDA to ensure weights are not being accessed.
+    Call this before performing RDMA writes to weight memory.
+    """
+    try:
+        success, message = await _global_state.tokenizer_manager.prepare_rdma_weight_update(
+            obj, request
+        )
+        content = {"success": success, "message": message, "status": "ready" if success else "error"}
+        return ORJSONResponse(content, status_code=200 if success else HTTPStatus.BAD_REQUEST)
+    except Exception as e:
+        logger.error(f"prepare_rdma_weight_update failed: {e}")
+        return ORJSONResponse(
+            {"success": False, "message": str(e), "status": "error"},
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR
+        )
+
+
+@app.post("/complete_rdma_weight_update")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def complete_rdma_weight_update(
+    obj: CompleteRDMAWeightUpdateReqInput, request: Request
+):
+    """Complete RDMA weight update.
+
+    Called after RDMA writes are done to synchronize and resume inference.
+    """
+    try:
+        success, message = await _global_state.tokenizer_manager.complete_rdma_weight_update(
+            obj, request
+        )
+        content = {"success": success, "message": message}
+        return ORJSONResponse(content, status_code=200 if success else HTTPStatus.BAD_REQUEST)
+    except Exception as e:
+        logger.error(f"complete_rdma_weight_update failed: {e}")
+        return ORJSONResponse(
+            {"success": False, "message": str(e)},
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR
+        )
 
 
 @app.post("/init_weights_update_group")

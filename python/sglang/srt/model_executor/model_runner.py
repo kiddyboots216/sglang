@@ -425,7 +425,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             enable=self.server_args.enable_memory_saver
         )
 
-        if self.server_args.remote_instance_weight_loader_use_transfer_engine():
+        if self.server_args.remote_instance_weight_loader_use_transfer_engine() or self.server_args.enable_rdma_weight_updates:
             self.remote_instance_init_transfer_engine()
 
         if not self.is_draft_worker:
@@ -467,7 +467,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.load_model()
 
         if (
-            self.server_args.remote_instance_weight_loader_use_transfer_engine()
+            (self.server_args.remote_instance_weight_loader_use_transfer_engine() or self.server_args.enable_rdma_weight_updates)
             and self.remote_instance_transfer_engine is not None
             and self.remote_instance_transfer_engine_weight_info is None
         ):
@@ -1694,6 +1694,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         buckets: list,
         group_name: str = "weight_update_group",
         flush_cache: bool = False,
+        recapture_cuda_graph: bool = True,
     ):
         """Receive weights via NCCL broadcast from an existing process group.
 
@@ -1757,12 +1758,79 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     # NCCL broadcast recv (src=0 is training)
                     torch.distributed.broadcast(recv_buffer, src=0, group=group)
 
+                    # Log checksum of received weight for cross-verification with sender
+                    if bucket_idx == 0:
+                        from sglang.srt.distributed import get_tensor_model_parallel_rank
+                        tp_rank = get_tensor_model_parallel_rank()
+                        checksum = recv_buffer.sum().item()
+                        logger.info(f"[RECEIVER TP{tp_rank}] Received {name}: shape={recv_buffer.shape}, dtype={recv_buffer.dtype}, checksum={checksum:.6f}")
+
                     all_weights.append((name, recv_buffer))
 
             logger.info(f"receive_weights: received {len(all_weights)} weights, applying to model")
 
+            # Ensure use_presharded_weights=False for NCCL weight sync
+            # NCCL sync sends FULL weights that need to be sharded per TP rank
+            for module in self.model.modules():
+                if hasattr(module, 'use_presharded_weights'):
+                    if module.use_presharded_weights:
+                        logger.warning(f"Resetting use_presharded_weights=False for {type(module).__name__}")
+                        module.use_presharded_weights = False
+
             # Apply the received weights
             self.model.load_weights(all_weights)
+
+            # DEBUG: Checksum verification for weight sync debugging
+            from sglang.srt.distributed import get_tensor_model_parallel_rank
+            tp_rank = get_tensor_model_parallel_rank()
+            logger.info(f"[TP{tp_rank}] DEBUG: Verifying weight checksums after load_weights()")
+            param_count = 0
+            for name, param in self.model.named_parameters():
+                if param_count < 10:  # Log first 10 params
+                    checksum = param.data.sum().item()
+                    logger.info(f"[TP{tp_rank}] After load: {name} shape={param.shape} checksum={checksum:.6f}")
+                param_count += 1
+
+            # DEBUG: Verify tied weights (embedding <-> lm_head)
+            try:
+                if hasattr(self.model, 'model') and hasattr(self.model.model, 'embed_tokens'):
+                    embed_ptr = self.model.model.embed_tokens.weight.data_ptr()
+                    lm_head_ptr = self.model.lm_head.weight.data_ptr() if hasattr(self.model, 'lm_head') and hasattr(self.model.lm_head, 'weight') else None
+                    logger.info(f"[TP{tp_rank}] Tied weights: embed_ptr={embed_ptr}, lm_head_ptr={lm_head_ptr}, same={embed_ptr == lm_head_ptr}")
+
+                    # Also log checksums for embed and lm_head
+                    embed_checksum = self.model.model.embed_tokens.weight.data.sum().item()
+                    logger.info(f"[TP{tp_rank}] embed_tokens.weight checksum={embed_checksum:.6f}")
+                    if hasattr(self.model, 'lm_head') and hasattr(self.model.lm_head, 'weight'):
+                        lm_head_checksum = self.model.lm_head.weight.data.sum().item()
+                        logger.info(f"[TP{tp_rank}] lm_head.weight checksum={lm_head_checksum:.6f}")
+            except Exception as e:
+                logger.warning(f"[TP{tp_rank}] Could not verify tied weights: {e}")
+
+            # Re-establish tied embeddings if necessary (defensive fix)
+            has_tied_embeddings = getattr(self.model_config.hf_config, 'tie_word_embeddings', False)
+            if has_tied_embeddings:
+                try:
+                    if hasattr(self.model, 'model') and hasattr(self.model.model, 'embed_tokens'):
+                        embed_weight = self.model.model.embed_tokens.weight
+                        if hasattr(self.model, 'lm_head') and hasattr(self.model.lm_head, 'weight'):
+                            if embed_weight.data_ptr() != self.model.lm_head.weight.data_ptr():
+                                logger.warning("receive_weights: tied embeddings aliasing broken, re-establishing...")
+                                self.model.lm_head.weight = embed_weight
+                                logger.info("receive_weights: tied embeddings re-established")
+                except Exception as e:
+                    logger.warning(f"receive_weights: could not verify/fix tied embeddings: {e}")
+
+            # CRITICAL: Synchronize CUDA to ensure all weight updates are complete
+            torch.cuda.synchronize()
+            logger.info("receive_weights: CUDA synchronized after weight update")
+
+            # CRITICAL: Recapture CUDA graphs after weight update
+            # CUDA graphs capture memory pointers at capture time - must recapture when weights change
+            if recapture_cuda_graph and self.device == "cuda" and not self.server_args.disable_cuda_graph:
+                logger.info("receive_weights: recapturing CUDA graphs after weight update")
+                self.init_device_graphs()
+                logger.info("receive_weights: CUDA graph recapture complete")
 
             logger.info("receive_weights: weights applied successfully")
             return True, f"Received and applied {len(all_weights)} weights"
@@ -1851,6 +1919,170 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         except Exception as e:
             logger.error(f"Error when getting parameter {name}: {e}")
             return None
+
+    # ========================================================================
+    # RDMA Direct Weight Update Methods
+    # ========================================================================
+
+    def get_rdma_weight_addresses(self, weight_names=None):
+        """Get RDMA-accessible weight addresses for direct GPU writes.
+
+        Returns weight memory addresses that can be used for RDMA PUSH model updates.
+        The TransferEngine must be initialized (via --enable-rdma-weight-updates flag).
+
+        Args:
+            weight_names: Optional list of specific weight names to get addresses for.
+                         If None, returns addresses for all weights.
+
+        Returns:
+            Dict with success, message, rdma_session_id, rdma_addr, and weights info.
+        """
+        # Check if RDMA weight updates are enabled
+        if not self.server_args.enable_rdma_weight_updates:
+            return {
+                "success": False,
+                "message": "RDMA weight updates not enabled. Start server with --enable-rdma-weight-updates",
+                "rdma_session_id": "",
+                "rdma_addr": "",
+                "weights": {},
+            }
+
+        # Check if TransferEngine is initialized
+        if self.remote_instance_transfer_engine is None:
+            return {
+                "success": False,
+                "message": "TransferEngine not initialized. Check mooncake installation.",
+                "rdma_session_id": "",
+                "rdma_addr": "",
+                "weights": {},
+            }
+
+        # Get weight info from registered memory regions
+        if self.remote_instance_transfer_engine_weight_info is None:
+            return {
+                "success": False,
+                "message": "Weight memory not registered for RDMA. Model may not be loaded.",
+                "rdma_session_id": "",
+                "rdma_addr": "",
+                "weights": {},
+            }
+
+        try:
+            # Build weights dict with memory addresses
+            weights_dict = {}
+            for name, info in self.remote_instance_transfer_engine_weight_info.items():
+                if weight_names is None or name in weight_names:
+                    # info is typically (data_ptr, numel, element_size)
+                    data_ptr, numel, element_size = info
+                    # Get dtype from model parameter
+                    dtype_str = "bfloat16"  # Default
+                    shape = []
+                    for param_name, param in self.model.named_parameters():
+                        if param_name == name or param_name.replace(".", "_") == name.replace(".", "_"):
+                            dtype_str = str(param.dtype).replace("torch.", "")
+                            shape = list(param.shape)
+                            break
+
+                    weights_dict[name] = {
+                        "data_ptr": data_ptr,
+                        "numel": numel,
+                        "element_size": element_size,
+                        "dtype": dtype_str,
+                        "shape": shape,
+                    }
+
+            return {
+                "success": True,
+                "message": f"Found {len(weights_dict)} weights",
+                "rdma_session_id": self.remote_instance_transfer_engine_session_id,
+                "rdma_addr": self.remote_instance_transfer_engine_session_id,  # Same format
+                "weights": weights_dict,
+            }
+        except Exception as e:
+            logger.error(f"get_rdma_weight_addresses failed: {e}")
+            return {
+                "success": False,
+                "message": str(e),
+                "rdma_session_id": "",
+                "rdma_addr": "",
+                "weights": {},
+            }
+
+    def get_remote_instance_transfer_engine_info(self):
+        """Get transfer engine info for remote instance weight loading."""
+        if self.remote_instance_transfer_engine_weight_info is None:
+            return "", {}
+        return (
+            self.remote_instance_transfer_engine_session_id,
+            self.remote_instance_transfer_engine_weight_info,
+        )
+
+    def prepare_rdma_weight_update(self, weight_version=""):
+        """Prepare for RDMA weight update.
+
+        This synchronizes CUDA to ensure no operations are in flight that might
+        access weights during the RDMA write.
+
+        Args:
+            weight_version: Optional version identifier for logging.
+
+        Returns:
+            Tuple[bool, str]: (success, message)
+        """
+        try:
+            logger.info(f"prepare_rdma_weight_update: version={weight_version}")
+
+            # Synchronize CUDA to ensure all pending operations complete
+            torch.cuda.synchronize()
+
+            logger.info("prepare_rdma_weight_update: CUDA synchronized, ready for RDMA writes")
+            return True, "Ready for RDMA weight writes"
+
+        except Exception as e:
+            error_msg = f"prepare_rdma_weight_update failed: {e}"
+            logger.error(error_msg)
+            return False, error_msg
+
+    def complete_rdma_weight_update(self, flush_cache=True, weight_version=""):
+        """Complete RDMA weight update.
+
+        Called after RDMA writes are done to synchronize and ensure weights
+        are visible to subsequent CUDA operations.
+
+        Args:
+            flush_cache: Whether to flush KV cache after weight update.
+            weight_version: Optional version identifier for logging.
+
+        Returns:
+            Tuple[bool, str]: (success, message)
+        """
+        try:
+            logger.info(f"complete_rdma_weight_update: version={weight_version}, flush_cache={flush_cache}")
+
+            # Synchronize CUDA to ensure RDMA writes are visible
+            torch.cuda.synchronize()
+
+            # Re-establish tied embeddings if necessary
+            has_tied_embeddings = getattr(self.model_config.hf_config, 'tie_word_embeddings', False)
+            if has_tied_embeddings:
+                try:
+                    if hasattr(self.model, 'model') and hasattr(self.model.model, 'embed_tokens'):
+                        embed_weight = self.model.model.embed_tokens.weight
+                        if hasattr(self.model, 'lm_head') and hasattr(self.model.lm_head, 'weight'):
+                            if embed_weight.data_ptr() != self.model.lm_head.weight.data_ptr():
+                                logger.warning("complete_rdma_weight_update: tied embeddings aliasing broken, re-establishing...")
+                                self.model.lm_head.weight = embed_weight
+                                logger.info("complete_rdma_weight_update: tied embeddings re-established")
+                except Exception as e:
+                    logger.warning(f"complete_rdma_weight_update: could not verify/fix tied embeddings: {e}")
+
+            logger.info("complete_rdma_weight_update: RDMA weight update completed successfully")
+            return True, "RDMA weight update completed"
+
+        except Exception as e:
+            error_msg = f"complete_rdma_weight_update failed: {e}"
+            logger.error(error_msg)
+            return False, error_msg
 
     def init_lora_manager(self):
         self.lora_manager = LoRAManager(

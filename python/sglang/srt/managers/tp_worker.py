@@ -22,13 +22,16 @@ import torch
 
 from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.managers.io_struct import (
+    CompleteRDMAWeightUpdateReqInput,
     CompleteWeightsUpdateReqInput,
     DestroyWeightsUpdateGroupReqInput,
+    GetRDMAWeightAddressesReqInput,
     GetWeightsByNameReqInput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsUpdateGroupReqInput,
     LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterReqInput,
+    PrepareRDMAWeightUpdateReqInput,
     PrepareWeightsUpdateReqInput,
     ReceiveWeightsReqInput,
     SendWeightsToRemoteInstanceReqInput,
@@ -178,6 +181,35 @@ class BaseTpWorker(ABC):
         )
         return success, message
 
+    # ========================================================================
+    # RDMA Direct Weight Update Methods
+    # ========================================================================
+
+    def get_rdma_weight_addresses(self, recv_req: GetRDMAWeightAddressesReqInput):
+        """Get RDMA-accessible weight addresses for direct GPU writes."""
+        return self.model_runner.get_rdma_weight_addresses(
+            weight_names=recv_req.weight_names,
+        )
+
+    def prepare_rdma_weight_update(self, recv_req: PrepareRDMAWeightUpdateReqInput):
+        """Prepare for RDMA weight update."""
+        success, message = self.model_runner.prepare_rdma_weight_update(
+            weight_version=recv_req.weight_version,
+        )
+        return success, message
+
+    def complete_rdma_weight_update(self, recv_req: CompleteRDMAWeightUpdateReqInput):
+        """Complete RDMA weight update."""
+        success, message = self.model_runner.complete_rdma_weight_update(
+            flush_cache=recv_req.flush_cache,
+            weight_version=recv_req.weight_version,
+        )
+        return success, message
+
+    def get_remote_instance_transfer_engine_info(self):
+        """Get RDMA transfer engine info for remote instance weight loading."""
+        return self.model_runner.get_remote_instance_transfer_engine_info()
+
     def receive_weights(self, recv_req: ReceiveWeightsReqInput):
         """Receive weights via NCCL broadcast from an existing process group.
 
@@ -189,6 +221,7 @@ class BaseTpWorker(ABC):
             buckets=recv_req.buckets,
             group_name=recv_req.group_name,
             flush_cache=recv_req.flush_cache,
+            recapture_cuda_graph=recv_req.recapture_cuda_graph,
         )
         return success, message
 

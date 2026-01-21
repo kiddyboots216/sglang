@@ -28,6 +28,8 @@ from sglang.srt.managers.io_struct import (
     ClearHiCacheReqInput,
     ClearHiCacheReqOutput,
     CloseSessionReqInput,
+    CompleteRDMAWeightUpdateReqInput,
+    CompleteRDMAWeightUpdateReqOutput,
     CompleteWeightsUpdateReqInput,
     CompleteWeightsUpdateReqOutput,
     DestroyWeightsUpdateGroupReqInput,
@@ -43,6 +45,8 @@ from sglang.srt.managers.io_struct import (
     GetLoadReqOutput,
     GetLoadsReqInput,
     GetLoadsReqOutput,
+    GetRDMAWeightAddressesReqInput,
+    GetRDMAWeightAddressesReqOutput,
     GetWeightsByNameReqInput,
     GetWeightsByNameReqOutput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
@@ -55,6 +59,8 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqOutput,
     LoRAUpdateOutput,
     OpenSessionReqInput,
+    PrepareRDMAWeightUpdateReqInput,
+    PrepareRDMAWeightUpdateReqOutput,
     PrepareWeightsUpdateReqInput,
     PrepareWeightsUpdateReqOutput,
     ProfileReq,
@@ -208,6 +214,16 @@ class TokenizerCommunicatorMixin:
         self.check_weights_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
+        # RDMA direct weight update communicators
+        self.get_rdma_weight_addresses_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
+        self.prepare_rdma_weight_update_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
+        self.complete_rdma_weight_update_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
         self.slow_down_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
@@ -299,6 +315,18 @@ class TokenizerCommunicatorMixin:
                 (
                     CheckWeightsReqOutput,
                     self.check_weights_communicator.handle_recv,
+                ),
+                (
+                    GetRDMAWeightAddressesReqOutput,
+                    self.get_rdma_weight_addresses_communicator.handle_recv,
+                ),
+                (
+                    PrepareRDMAWeightUpdateReqOutput,
+                    self.prepare_rdma_weight_update_communicator.handle_recv,
+                ),
+                (
+                    CompleteRDMAWeightUpdateReqOutput,
+                    self.complete_rdma_weight_update_communicator.handle_recv,
                 ),
                 (
                     SlowDownReqOutput,
@@ -537,6 +565,103 @@ class TokenizerCommunicatorMixin:
             return success, message
         finally:
             # Reset the flag after the complete phase
+            self._weight_update_in_progress = False
+
+    # ========================================================================
+    # RDMA Direct Weight Update Methods
+    # ========================================================================
+
+    async def get_rdma_weight_addresses(
+        self: TokenizerManager,
+        obj: GetRDMAWeightAddressesReqInput,
+        rank: int = 0,
+    ) -> Dict[str, Any]:
+        """Get RDMA-accessible weight addresses for direct GPU writes.
+
+        Returns weight memory addresses that can be used for RDMA PUSH model updates.
+        """
+        self.auto_create_handle_loop()
+
+        # For RDMA addresses, we want the result from a specific rank
+        # Send to all schedulers but only use result from the requested rank
+        results = await self.get_rdma_weight_addresses_communicator(obj)
+
+        # Return the result (merged across DP ranks if applicable)
+        if results and len(results) > 0:
+            # Return the first successful result
+            for result in results:
+                if hasattr(result, "success") and result.success:
+                    return {
+                        "success": result.success,
+                        "message": result.message,
+                        "rdma_session_id": result.rdma_session_id,
+                        "rdma_addr": result.rdma_addr,
+                        "weights": result.weights,
+                    }
+            # If no success, return the first result's error
+            result = results[0]
+            return {
+                "success": result.success,
+                "message": result.message,
+                "rdma_session_id": "",
+                "rdma_addr": "",
+                "weights": {},
+            }
+        return {
+            "success": False,
+            "message": "No response from scheduler",
+            "rdma_session_id": "",
+            "rdma_addr": "",
+            "weights": {},
+        }
+
+    async def prepare_rdma_weight_update(
+        self: TokenizerManager,
+        obj: PrepareRDMAWeightUpdateReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> Tuple[bool, str]:
+        """Prepare for RDMA weight update.
+
+        This pauses inference and synchronizes CUDA to ensure weights are not being accessed.
+        """
+        self.auto_create_handle_loop()
+
+        # Set the flag to indicate weight update is in progress
+        self._weight_update_in_progress = True
+
+        try:
+            results = await self.prepare_rdma_weight_update_communicator(obj)
+            success, message = _Communicator.merge_results(results)
+
+            if not success:
+                self._weight_update_in_progress = False
+
+            return success, message
+        except Exception as e:
+            self._weight_update_in_progress = False
+            raise e
+
+    async def complete_rdma_weight_update(
+        self: TokenizerManager,
+        obj: CompleteRDMAWeightUpdateReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> Tuple[bool, str]:
+        """Complete RDMA weight update.
+
+        Called after RDMA writes are done to synchronize and resume inference.
+        """
+        self.auto_create_handle_loop()
+
+        try:
+            results = await self.complete_rdma_weight_update_communicator(obj)
+            success, message = _Communicator.merge_results(results)
+
+            if success and obj.weight_version:
+                self._update_weight_version_if_provided(obj.weight_version)
+                message += f" Weight version updated to {obj.weight_version}."
+
+            return success, message
+        finally:
             self._weight_update_in_progress = False
 
     async def receive_weights(
