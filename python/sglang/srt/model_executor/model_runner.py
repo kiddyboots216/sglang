@@ -1358,6 +1358,154 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             logger.error(error_msg)
             return False, error_msg
 
+    def update_weights_from_distributed_inplace(
+        self,
+        names,
+        group_name,
+    ):
+        """
+        Update model weights in-place via NCCL broadcast.
+
+        Unlike update_weights_from_distributed which creates temporary buffers,
+        this method broadcasts directly into the model's parameter tensors.
+        This is zero-copy and requires no additional GPU memory.
+
+        Args:
+            names: List of parameter names to update (must match model parameter names)
+            group_name: NCCL group name
+
+        Returns:
+            Tuple of (success, message)
+        """
+        assert group_name in self._model_update_group, (
+            f"Group {group_name} not in {list(self._model_update_group.keys())}. "
+            "Please call `init_weights_update_group` first."
+        )
+
+        try:
+            # Build dict of model parameters
+            params_dict = dict(self.model.named_parameters())
+
+            handles = []
+            updated_names = []
+
+            for name in names:
+                if name not in params_dict:
+                    logger.warning(f"[NCCL_INPLACE] Parameter {name} not found in model, skipping")
+                    continue
+
+                param = params_dict[name]
+
+                # Broadcast directly into param.data (zero-copy!)
+                handle = torch.distributed.broadcast(
+                    param.data,
+                    src=0,
+                    group=self._model_update_group[group_name],
+                    async_op=True,
+                )
+                handles.append(handle)
+                updated_names.append(name)
+
+            # Wait for all broadcasts to complete
+            for handle in handles:
+                handle.wait()
+
+            logger.info(f"[NCCL_INPLACE] Updated {len(updated_names)} parameters in-place")
+            return True, f"Succeeded to update {len(updated_names)} parameters in-place."
+
+        except Exception as e:
+            error_msg = f"Failed to update parameters in-place: {e}"
+            logger.error(error_msg)
+            return False, error_msg
+
+    def update_weights_from_scattered(
+        self,
+        names,
+        group_name,
+    ):
+        """
+        Update model weights in-place via NCCL scatter for TP>1.
+
+        Unlike broadcast (which sends identical data to all ranks), scatter sends
+        different TP shards to each rank. This enables zero-copy in-place updates
+        for tensor-parallel models while preserving CUDA graphs.
+
+        The training side (rank 0) pre-shards weights and uses NCCL scatter to send
+        different shards to each inference rank directly into param.data.
+
+        Args:
+            names: List of parameter names to update (must match model parameter names)
+            group_name: NCCL group name
+
+        Returns:
+            Tuple of (success, message)
+        """
+        assert group_name in self._model_update_group, (
+            f"Group {group_name} not in {list(self._model_update_group.keys())}. "
+            "Please call `init_weights_update_group` first."
+        )
+
+        try:
+            # Build dict of model parameters
+            params_dict = dict(self.model.named_parameters())
+
+            updated_names = []
+
+            for idx, name in enumerate(names):
+                if name not in params_dict:
+                    logger.warning(f"[NCCL_SCATTER] Parameter {name} not found in model, skipping")
+                    continue
+
+                param = params_dict[name]
+
+                # DEBUG: Log param stats BEFORE scatter for first few and key weights
+                if idx < 5 or "qkv_proj" in name or "w13_weight" in name:
+                    p = param.data.float()
+                    logger.info(
+                        f"[NCCL_SCATTER_PRE] TP{self.tp_rank} {name}: shape={list(param.data.shape)}, "
+                        f"sum={p.sum().item():.4f}, mean={p.mean().item():.6f}"
+                    )
+
+                # NCCL scatter: each rank receives different data from src=0
+                # On receiver side (this code), scatter_list=None
+                # The recv tensor is param.data - receive directly into the parameter (zero-copy!)
+                torch.distributed.scatter(
+                    param.data,  # Receive buffer - this rank's shard goes here
+                    scatter_list=None,  # Receivers don't provide scatter_list
+                    src=0,  # Training (rank 0) is the sender
+                    group=self._model_update_group[group_name],
+                )
+
+                # DEBUG: Log param stats AFTER scatter for first few and key weights
+                if idx < 5 or "qkv_proj" in name or "w13_weight" in name:
+                    p = param.data.float()
+                    logger.info(
+                        f"[NCCL_SCATTER_POST] TP{self.tp_rank} {name}: shape={list(param.data.shape)}, "
+                        f"sum={p.sum().item():.4f}, mean={p.mean().item():.6f}"
+                    )
+                    if "qkv_proj" in name and "layers.0." in name:
+                        # Log Q, K, V separately for detailed analysis
+                        # Q=512, K=128, V=128 per TP rank for this model
+                        q_part = param.data[:512].float()
+                        k_part = param.data[512:640].float()
+                        v_part = param.data[640:].float()
+                        logger.info(
+                            f"[NCCL_SCATTER_QKV_DETAIL] TP{self.tp_rank} {name}: "
+                            f"Q_sum={q_part.sum().item():.4f}, "
+                            f"K_sum={k_part.sum().item():.4f}, "
+                            f"V_sum={v_part.sum().item():.4f}"
+                        )
+
+                updated_names.append(name)
+
+            logger.info(f"[NCCL_SCATTER] Updated {len(updated_names)} parameters in-place via scatter")
+            return True, f"Succeeded to update {len(updated_names)} parameters via scatter."
+
+        except Exception as e:
+            error_msg = f"Failed to update parameters via scatter: {e}"
+            logger.error(error_msg)
+            return False, error_msg
+
     def prepare_weights_update(
         self,
         buckets,

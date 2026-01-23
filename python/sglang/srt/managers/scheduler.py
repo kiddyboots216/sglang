@@ -123,8 +123,10 @@ from sglang.srt.managers.io_struct import (
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
     UpdateWeightFromDiskReqInput,
+    UpdateWeightsFromDistributedInplaceReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
+    UpdateWeightsFromScatteredReqInput,
     UpdateWeightsFromTensorReqInput,
     CompleteWeightsUpdateReqInput,
 )
@@ -1037,6 +1039,14 @@ class Scheduler(
                 (
                     UpdateWeightsFromDistributedReqInput,
                     self.update_weights_from_distributed,
+                ),
+                (
+                    UpdateWeightsFromDistributedInplaceReqInput,
+                    self.update_weights_from_distributed_inplace,
+                ),
+                (
+                    UpdateWeightsFromScatteredReqInput,
+                    self.update_weights_from_scattered,
                 ),
                 (PrepareWeightsUpdateReqInput, self.prepare_weights_update),
                 (CompleteWeightsUpdateReqInput, self.complete_weights_update),

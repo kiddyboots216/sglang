@@ -84,8 +84,11 @@ from sglang.srt.managers.io_struct import (
     SlowDownReqOutput,
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
+    UpdateWeightsFromDistributedInplaceReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromDistributedReqOutput,
+    UpdateWeightsFromScatteredReqInput,
+    UpdateWeightsFromScatteredReqOutput,
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromIPCReqOutput,
     UpdateWeightsFromTensorReqInput,
@@ -183,6 +186,12 @@ class TokenizerCommunicatorMixin:
             self.send_to_scheduler, server_args.dp_size
         )
         self.update_weights_from_distributed_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
+        self.update_weights_from_distributed_inplace_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
+        self.update_weights_from_scattered_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
         self.prepare_weights_update_communicator = _Communicator(
@@ -283,6 +292,10 @@ class TokenizerCommunicatorMixin:
                 (
                     UpdateWeightsFromDistributedReqOutput,
                     self.update_weights_from_distributed_communicator.handle_recv,
+                ),
+                (
+                    UpdateWeightsFromScatteredReqOutput,
+                    self.update_weights_from_scattered_communicator.handle_recv,
                 ),
                 (
                     PrepareWeightsUpdateReqOutput,
@@ -517,6 +530,79 @@ class TokenizerCommunicatorMixin:
         try:
             async with lock_context:
                 results = await self.update_weights_from_distributed_communicator(obj)
+
+            success, message = _Communicator.merge_results(results)
+            if success and obj.weight_version is not None:
+                self._update_weight_version_if_provided(obj.weight_version)
+                message += f" Weight version updated to {obj.weight_version}."
+
+            return success, message
+        finally:
+            self._weight_update_in_progress = False
+
+    async def update_weights_from_distributed_inplace(
+        self: TokenizerManager,
+        obj: UpdateWeightsFromDistributedInplaceReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> Tuple[bool, str]:
+        """Update model weights in-place via NCCL broadcast (zero-copy)."""
+        self.auto_create_handle_loop()
+        assert (
+            self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
+        ), "dp_size must be 1 or dp attention must be enabled"
+
+        # Immediately update the weights if the engine is in paused state
+        async with self.is_pause_cond:
+            is_paused = self.is_pause
+
+        lock_context = (
+            self.model_update_lock.writer_lock if not is_paused else nullcontext()
+        )
+        self._weight_update_in_progress = True
+        try:
+            async with lock_context:
+                results = await self.update_weights_from_distributed_inplace_communicator(
+                    obj
+                )
+
+            success, message = _Communicator.merge_results(results)
+            if success and obj.weight_version is not None:
+                self._update_weight_version_if_provided(obj.weight_version)
+                message += f" Weight version updated to {obj.weight_version}."
+
+            return success, message
+        finally:
+            self._weight_update_in_progress = False
+
+    async def update_weights_from_scattered(
+        self: TokenizerManager,
+        obj: UpdateWeightsFromScatteredReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> Tuple[bool, str]:
+        """Update model weights in-place via NCCL scatter for TP>1.
+
+        Unlike broadcast (which sends identical data to all ranks), scatter sends
+        different TP shards to each rank. This enables zero-copy in-place updates
+        for tensor-parallel models while preserving CUDA graphs.
+        """
+        self.auto_create_handle_loop()
+        assert (
+            self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
+        ), "dp_size must be 1 or dp attention must be enabled"
+
+        # Immediately update the weights if the engine is in paused state
+        async with self.is_pause_cond:
+            is_paused = self.is_pause
+
+        lock_context = (
+            self.model_update_lock.writer_lock if not is_paused else nullcontext()
+        )
+        self._weight_update_in_progress = True
+        try:
+            async with lock_context:
+                results = await self.update_weights_from_scattered_communicator(
+                    obj
+                )
 
             success, message = _Communicator.merge_results(results)
             if success and obj.weight_version is not None:

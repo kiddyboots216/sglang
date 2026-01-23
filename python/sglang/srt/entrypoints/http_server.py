@@ -125,7 +125,9 @@ from sglang.srt.managers.io_struct import (
     SlowDownReqInput,
     UnloadLoRAAdapterReqInput,
     UpdateWeightFromDiskReqInput,
+    UpdateWeightsFromDistributedInplaceReqInput,
     UpdateWeightsFromDistributedReqInput,
+    UpdateWeightsFromScatteredReqInput,
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightVersionReqInput,
@@ -1140,6 +1142,52 @@ async def update_weights_from_distributed(
     """Update model parameter from distributed online."""
     success, message = (
         await _global_state.tokenizer_manager.update_weights_from_distributed(
+            obj, request
+        )
+    )
+
+    content = {"success": success, "message": message}
+    if success:
+        return ORJSONResponse(content, status_code=200)
+    else:
+        return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
+
+
+@app.post("/update_weights_from_distributed_inplace")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def update_weights_from_distributed_inplace(
+    obj: UpdateWeightsFromDistributedInplaceReqInput, request: Request
+):
+    """Update model weights in-place via NCCL broadcast (zero-copy, no temp buffers)."""
+    success, message = (
+        await _global_state.tokenizer_manager.update_weights_from_distributed_inplace(
+            obj, request
+        )
+    )
+
+    content = {"success": success, "message": message}
+    if success:
+        return ORJSONResponse(content, status_code=200)
+    else:
+        return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
+
+
+@app.post("/update_weights_from_scattered")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def update_weights_from_scattered(
+    obj: UpdateWeightsFromScatteredReqInput, request: Request
+):
+    """Update model weights in-place via NCCL scatter for TP>1.
+
+    Unlike broadcast (which sends identical data to all ranks), scatter sends
+    different TP shards to each rank. This enables zero-copy in-place updates
+    for tensor-parallel models while preserving CUDA graphs.
+
+    The training side (rank 0) pre-shards weights and uses NCCL scatter to send
+    different shards to each inference rank directly into param.data.
+    """
+    success, message = (
+        await _global_state.tokenizer_manager.update_weights_from_scattered(
             obj, request
         )
     )

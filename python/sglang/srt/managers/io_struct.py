@@ -1246,6 +1246,46 @@ class UpdateWeightsFromDistributedReqOutput(BaseReq):
 
 
 @dataclass
+class UpdateWeightsFromDistributedInplaceReqInput(BaseReq):
+    """Request to update weights in-place via NCCL broadcast.
+
+    Unlike UpdateWeightsFromDistributedReqInput, this broadcasts directly into
+    model parameter tensors without creating temporary buffers. Zero-copy and
+    requires no additional GPU memory.
+    """
+
+    names: List[str]  # Parameter names to update (must match model parameter names)
+    group_name: str = "weight_update_group"
+    flush_cache: bool = True
+    weight_version: Optional[str] = None
+
+
+@dataclass
+class UpdateWeightsFromScatteredReqInput(BaseReq):
+    """Request to update weights in-place via NCCL scatter for TP>1.
+
+    Unlike broadcast (which sends identical data to all ranks), scatter sends
+    different TP shards to each rank. This enables zero-copy in-place updates
+    for tensor-parallel models while preserving CUDA graphs.
+
+    The training side (rank 0) pre-shards weights and uses NCCL scatter to send
+    different shards to each inference rank directly into param.data.
+    """
+
+    names: List[str]  # Parameter names to update (must match model parameter names)
+    group_name: str = "weight_update_group"
+    tp_size: int = 1  # Tensor parallel size
+    flush_cache: bool = True
+    weight_version: Optional[str] = None
+
+
+@dataclass
+class UpdateWeightsFromScatteredReqOutput(BaseReq):
+    success: bool
+    message: str
+
+
+@dataclass
 class WeightBucket:
     """A single bucket of weights for batched weight updates."""
 

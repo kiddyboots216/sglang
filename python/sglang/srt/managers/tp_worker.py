@@ -39,8 +39,10 @@ from sglang.srt.managers.io_struct import (
     SendWeightsToRemoteInstanceReqInput,
     UnloadLoRAAdapterReqInput,
     UpdateWeightFromDiskReqInput,
+    UpdateWeightsFromDistributedInplaceReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
+    UpdateWeightsFromScatteredReqInput,
     UpdateWeightsFromTensorReqInput,
 )
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
@@ -156,6 +158,26 @@ class BaseTpWorker(ABC):
             recv_req.shapes,
             recv_req.group_name,
             recv_req.load_format,
+        )
+        return success, message
+
+    def update_weights_from_distributed_inplace(
+        self, recv_req: UpdateWeightsFromDistributedInplaceReqInput
+    ):
+        """Update weights in-place via NCCL broadcast (zero-copy)."""
+        success, message = self.model_runner.update_weights_from_distributed_inplace(
+            recv_req.names,
+            recv_req.group_name,
+        )
+        return success, message
+
+    def update_weights_from_scattered(
+        self, recv_req: UpdateWeightsFromScatteredReqInput
+    ):
+        """Update weights in-place via NCCL scatter for TP>1."""
+        success, message = self.model_runner.update_weights_from_scattered(
+            recv_req.names,
+            recv_req.group_name,
         )
         return success, message
 

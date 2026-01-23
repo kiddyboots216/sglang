@@ -43,8 +43,11 @@ from sglang.srt.managers.io_struct import (
     ResumeMemoryOccupationReqOutput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightFromDiskReqOutput,
+    UpdateWeightsFromDistributedInplaceReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromDistributedReqOutput,
+    UpdateWeightsFromScatteredReqInput,
+    UpdateWeightsFromScatteredReqOutput,
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromIPCReqOutput,
     UpdateWeightsFromTensorReqInput,
@@ -150,6 +153,59 @@ class SchedulerUpdateWeightsMixin:
             return UpdateWeightsFromDistributedReqOutput(success=False, message=str(e))
 
         return UpdateWeightsFromDistributedReqOutput(success, message)
+
+    def update_weights_from_distributed_inplace(
+        self,
+        recv_req: UpdateWeightsFromDistributedInplaceReqInput,
+    ) -> Tuple[bool, str]:
+        """Update model weights in-place via NCCL broadcast (zero-copy)."""
+        try:
+            success, message = self.tp_worker.update_weights_from_distributed_inplace(
+                recv_req
+            )
+
+            if success:
+                if recv_req.flush_cache:
+                    flush_cache_success = self.flush_cache()
+                    assert (
+                        flush_cache_success
+                    ), "Cache flush failed after updating weights"
+            else:
+                logger.error(message)
+        except Exception as e:
+            logger.error(f"update_weights_from_distributed_inplace failed: {e}")
+            return UpdateWeightsFromDistributedReqOutput(success=False, message=str(e))
+
+        return UpdateWeightsFromDistributedReqOutput(success, message)
+
+    def update_weights_from_scattered(
+        self,
+        recv_req: UpdateWeightsFromScatteredReqInput,
+    ) -> Tuple[bool, str]:
+        """Update model weights in-place via NCCL scatter for TP>1.
+
+        Unlike broadcast (which sends identical data to all ranks), scatter sends
+        different TP shards to each rank. This enables zero-copy in-place updates
+        for tensor-parallel models while preserving CUDA graphs.
+        """
+        try:
+            success, message = self.tp_worker.update_weights_from_scattered(
+                recv_req
+            )
+
+            if success:
+                if recv_req.flush_cache:
+                    flush_cache_success = self.flush_cache()
+                    assert (
+                        flush_cache_success
+                    ), "Cache flush failed after updating weights"
+            else:
+                logger.error(message)
+        except Exception as e:
+            logger.error(f"update_weights_from_scattered failed: {e}")
+            return UpdateWeightsFromScatteredReqOutput(success=False, message=str(e))
+
+        return UpdateWeightsFromScatteredReqOutput(success, message)
 
     def prepare_weights_update(
         self: Scheduler,
