@@ -24,11 +24,13 @@ from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.managers.io_struct import (
     CompleteRDMAWeightUpdateReqInput,
     CompleteWeightsUpdateReqInput,
+    DebugWeightReqInput,
     DestroyWeightsUpdateGroupReqInput,
     GetRDMAWeightAddressesReqInput,
     GetWeightsByNameReqInput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsUpdateGroupReqInput,
+    ListWeightsReqInput,
     LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterReqInput,
     PrepareRDMAWeightUpdateReqInput,
@@ -205,6 +207,14 @@ class BaseTpWorker(ABC):
             weight_version=recv_req.weight_version,
         )
         return success, message
+
+    def debug_weight(self, recv_req):
+        """Get debug info about a specific weight for RDMA debugging."""
+        return self.model_runner.debug_weight(name=recv_req.name)
+
+    def list_weights(self, recv_req):
+        """List all weight names in the model."""
+        return self.model_runner.list_weights(prefix=recv_req.prefix)
 
     def get_remote_instance_transfer_engine_info(self):
         """Get RDMA transfer engine info for remote instance weight loading."""

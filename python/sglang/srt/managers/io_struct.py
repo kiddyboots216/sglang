@@ -2023,6 +2023,8 @@ class GetRDMAWeightAddressesReqOutput(BaseReq):
 
     success: bool
     message: str = ""
+    # TP rank that this response is from (needed for multi-GPU RDMA)
+    tp_rank: int = 0
     # RDMA session ID for TransferEngine handshake
     rdma_session_id: str = ""
     # RDMA address (host:port) for TransferEngine connection
@@ -2072,6 +2074,59 @@ class CompleteRDMAWeightUpdateReqOutput(BaseReq):
 
     success: bool
     message: str = ""
+
+
+@dataclass
+class DebugWeightReqInput(BaseReq):
+    """Request to get debug info about a specific weight for RDMA debugging.
+
+    This endpoint helps debug RDMA weight sync by returning detailed tensor info
+    including checksum, first/last values, and memory addresses.
+    """
+
+    # Weight name to inspect (e.g., "model.layers.0.input_layernorm.weight")
+    name: str = ""
+
+
+@dataclass
+class DebugWeightReqOutput(BaseReq):
+    """Response with detailed weight tensor info for debugging."""
+
+    success: bool
+    message: str = ""
+    # Weight info
+    name: str = ""
+    shape: List[int] = field(default_factory=list)
+    dtype: str = ""
+    data_ptr: int = 0
+    checksum: float = 0.0
+    first_values: List[float] = field(default_factory=list)
+    last_values: List[float] = field(default_factory=list)
+    # TP rank this response is from
+    tp_rank: int = 0
+
+
+@dataclass
+class ListWeightsReqInput(BaseReq):
+    """Request to list all weight names in the model.
+
+    Used to verify weight name mapping between training and inference servers.
+    """
+
+    # Optional filter prefix (e.g., "model.layers.0" to only list layer 0 weights)
+    prefix: Optional[str] = None
+
+
+@dataclass
+class ListWeightsReqOutput(BaseReq):
+    """Response containing list of all weights in the model."""
+
+    success: bool
+    message: str = ""
+    # List of weight info: [{name, shape, data_ptr}]
+    weights: List[Dict[str, Any]] = field(default_factory=list)
+    # TP rank this response is from
+    tp_rank: int = 0
 
 
 def _check_all_req_types():

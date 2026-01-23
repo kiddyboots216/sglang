@@ -1972,16 +1972,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             weights_dict = {}
             for name, info in self.remote_instance_transfer_engine_weight_info.items():
                 if weight_names is None or name in weight_names:
-                    # info is typically (data_ptr, numel, element_size)
-                    data_ptr, numel, element_size = info
-                    # Get dtype from model parameter
-                    dtype_str = "bfloat16"  # Default
-                    shape = []
-                    for param_name, param in self.model.named_parameters():
-                        if param_name == name or param_name.replace(".", "_") == name.replace(".", "_"):
-                            dtype_str = str(param.dtype).replace("torch.", "")
-                            shape = list(param.shape)
-                            break
+                    # info can be (data_ptr, numel, element_size) or (data_ptr, numel, element_size, shape, dtype)
+                    if len(info) >= 5:
+                        data_ptr, numel, element_size, shape, dtype_str = info[:5]
+                    else:
+                        data_ptr, numel, element_size = info[:3]
+                        dtype_str = "bfloat16"  # Default
+                        shape = []
 
                     weights_dict[name] = {
                         "data_ptr": data_ptr,
@@ -2083,6 +2080,102 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             error_msg = f"complete_rdma_weight_update failed: {e}"
             logger.error(error_msg)
             return False, error_msg
+
+    def debug_weight(self, name: str):
+        """Get detailed debug info about a specific weight tensor.
+
+        Used to verify RDMA weight sync by comparing tensor values before/after transfer.
+
+        Args:
+            name: Parameter name (e.g., "model.layers.0.input_layernorm.weight")
+
+        Returns:
+            Dict with success, name, shape, dtype, data_ptr, checksum, first/last values.
+        """
+        try:
+            # Find the parameter by name
+            for param_name, param in self.model.named_parameters():
+                if param_name == name or param_name.replace(".", "_") == name.replace(".", "_"):
+                    # Compute debug info
+                    with torch.no_grad():
+                        data = param.data
+                        flat = data.flatten().float()
+                        checksum = flat.sum().item()
+                        first_values = flat[:10].tolist() if flat.numel() >= 10 else flat.tolist()
+                        last_values = flat[-10:].tolist() if flat.numel() >= 10 else []
+
+                    return {
+                        "success": True,
+                        "message": f"Found weight {param_name}",
+                        "name": param_name,
+                        "shape": list(data.shape),
+                        "dtype": str(data.dtype).replace("torch.", ""),
+                        "data_ptr": data.data_ptr(),
+                        "checksum": checksum,
+                        "first_values": first_values,
+                        "last_values": last_values,
+                    }
+
+            return {
+                "success": False,
+                "message": f"Weight {name} not found",
+                "name": name,
+                "shape": [],
+                "dtype": "",
+                "data_ptr": 0,
+                "checksum": 0.0,
+                "first_values": [],
+                "last_values": [],
+            }
+
+        except Exception as e:
+            logger.error(f"debug_weight failed: {e}")
+            return {
+                "success": False,
+                "message": str(e),
+                "name": name,
+                "shape": [],
+                "dtype": "",
+                "data_ptr": 0,
+                "checksum": 0.0,
+                "first_values": [],
+                "last_values": [],
+            }
+
+    def list_weights(self, prefix: str = None):
+        """List all weight names in the model.
+
+        Used to verify weight name mapping between training and inference servers.
+
+        Args:
+            prefix: Optional filter prefix (e.g., "model.layers.0")
+
+        Returns:
+            Dict with success, weights list [{name, shape, data_ptr}].
+        """
+        try:
+            weights = []
+            for param_name, param in self.model.named_parameters():
+                if prefix is None or param_name.startswith(prefix):
+                    weights.append({
+                        "name": param_name,
+                        "shape": list(param.shape),
+                        "data_ptr": param.data.data_ptr(),
+                    })
+
+            return {
+                "success": True,
+                "message": f"Found {len(weights)} weights",
+                "weights": weights,
+            }
+
+        except Exception as e:
+            logger.error(f"list_weights failed: {e}")
+            return {
+                "success": False,
+                "message": str(e),
+                "weights": [],
+            }
 
     def init_lora_manager(self):
         self.lora_manager = LoRAManager(

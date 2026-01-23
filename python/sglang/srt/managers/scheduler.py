@@ -91,6 +91,8 @@ from sglang.srt.managers.io_struct import (
     GetLoadsReqInput,
     GetRDMAWeightAddressesReqInput,
     GetWeightsByNameReqInput,
+    DebugWeightReqInput,
+    ListWeightsReqInput,
     HealthCheckOutput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsSendGroupForRemoteInstanceReqOutput,
@@ -1041,6 +1043,8 @@ class Scheduler(
                 (GetRDMAWeightAddressesReqInput, self.get_rdma_weight_addresses),
                 (PrepareRDMAWeightUpdateReqInput, self.prepare_rdma_weight_update),
                 (CompleteRDMAWeightUpdateReqInput, self.complete_rdma_weight_update),
+                (DebugWeightReqInput, self.debug_weight),
+                (ListWeightsReqInput, self.list_weights),
                 (ReceiveWeightsReqInput, self.receive_weights),
                 (UpdateWeightsFromTensorReqInput, self.update_weights_from_tensor),
                 (UpdateWeightsFromIPCReqInput, self.update_weights_from_ipc),
@@ -2916,7 +2920,8 @@ def run_scheduler_process(
             "max_total_num_tokens": scheduler.max_total_num_tokens,
             "max_req_input_len": scheduler.max_req_input_len,
         }
-        if server_args.remote_instance_weight_loader_use_transfer_engine():
+        # Collect transfer engine info at startup for remote instance loading OR RDMA weight updates
+        if server_args.remote_instance_weight_loader_use_transfer_engine() or server_args.enable_rdma_weight_updates:
             (
                 remote_instance_transfer_engine_session_id,
                 remote_instance_transfer_engine_weights_info_dict,

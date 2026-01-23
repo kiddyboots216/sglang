@@ -19,6 +19,8 @@ from sglang.srt.managers.io_struct import (
     CompleteRDMAWeightUpdateReqOutput,
     CompleteWeightsUpdateReqInput,
     CompleteWeightsUpdateReqOutput,
+    DebugWeightReqInput,
+    DebugWeightReqOutput,
     DestroyWeightsUpdateGroupReqInput,
     DestroyWeightsUpdateGroupReqOutput,
     GetRDMAWeightAddressesReqInput,
@@ -27,6 +29,8 @@ from sglang.srt.managers.io_struct import (
     GetWeightsByNameReqOutput,
     InitWeightsUpdateGroupReqInput,
     InitWeightsUpdateGroupReqOutput,
+    ListWeightsReqInput,
+    ListWeightsReqOutput,
     PrepareRDMAWeightUpdateReqInput,
     PrepareRDMAWeightUpdateReqOutput,
     PrepareWeightsUpdateReqInput,
@@ -209,12 +213,14 @@ class SchedulerUpdateWeightsMixin:
         """Get RDMA-accessible weight addresses for direct GPU writes.
 
         Returns weight memory addresses that can be used for RDMA PUSH model updates.
+        Each scheduler returns its own tp_rank so clients can route to the correct addresses.
         """
         try:
             result = self.tp_worker.get_rdma_weight_addresses(recv_req)
             return GetRDMAWeightAddressesReqOutput(
                 success=result.get("success", False),
                 message=result.get("message", ""),
+                tp_rank=self.tp_rank,  # Include TP rank for multi-GPU routing
                 rdma_session_id=result.get("rdma_session_id", ""),
                 rdma_addr=result.get("rdma_addr", ""),
                 weights=result.get("weights", {}),
@@ -224,6 +230,7 @@ class SchedulerUpdateWeightsMixin:
             return GetRDMAWeightAddressesReqOutput(
                 success=False,
                 message=str(e),
+                tp_rank=self.tp_rank,  # Include TP rank even on error
                 rdma_session_id="",
                 rdma_addr="",
                 weights={},
@@ -281,6 +288,60 @@ class SchedulerUpdateWeightsMixin:
 
         return CompleteRDMAWeightUpdateReqOutput(success=success, message=message)
 
+    def debug_weight(
+        self: Scheduler,
+        recv_req: DebugWeightReqInput,
+    ) -> DebugWeightReqOutput:
+        """Get detailed debug info about a specific weight tensor.
+
+        Used to verify RDMA weight sync by comparing tensor values before/after transfer.
+        """
+        try:
+            result = self.tp_worker.debug_weight(recv_req)
+            return DebugWeightReqOutput(
+                success=result.get("success", False),
+                message=result.get("message", ""),
+                name=result.get("name", ""),
+                shape=result.get("shape", []),
+                dtype=result.get("dtype", ""),
+                data_ptr=result.get("data_ptr", 0),
+                checksum=result.get("checksum", 0.0),
+                first_values=result.get("first_values", []),
+                last_values=result.get("last_values", []),
+                tp_rank=self.tp_rank,
+            )
+        except Exception as e:
+            logger.error(f"debug_weight failed: {e}")
+            return DebugWeightReqOutput(
+                success=False,
+                message=str(e),
+                tp_rank=self.tp_rank,
+            )
+
+    def list_weights(
+        self: Scheduler,
+        recv_req: ListWeightsReqInput,
+    ) -> ListWeightsReqOutput:
+        """List all weight names in the model.
+
+        Used to verify weight name mapping between training and inference servers.
+        """
+        try:
+            result = self.tp_worker.list_weights(recv_req)
+            return ListWeightsReqOutput(
+                success=result.get("success", False),
+                message=result.get("message", ""),
+                weights=result.get("weights", []),
+                tp_rank=self.tp_rank,
+            )
+        except Exception as e:
+            logger.error(f"list_weights failed: {e}")
+            return ListWeightsReqOutput(
+                success=False,
+                message=str(e),
+                tp_rank=self.tp_rank,
+            )
+
     def receive_weights(
         self: Scheduler,
         recv_req: ReceiveWeightsReqInput,
@@ -291,6 +352,8 @@ class SchedulerUpdateWeightsMixin:
         Assumes inference is already paused and NCCL group is initialized.
         """
         kv_cache_freed = False
+        # Track if we need to recapture CUDA graphs after buffer recreation
+        need_recapture_cuda_graph = False
         try:
             # Free KV cache memory before receiving weights if requested
             # This helps avoid OOM when the KV cache takes most of GPU memory
@@ -311,6 +374,14 @@ class SchedulerUpdateWeightsMixin:
                 kv_cache_freed = True
                 logger.info("KV cache memory freed successfully.")
 
+                # If KV cache is freed, we cannot recapture CUDA graphs inside receive_weights
+                # because the forward pass during graph capture needs the KV cache buffers.
+                # We'll recapture AFTER recreating the buffers.
+                if recv_req.recapture_cuda_graph:
+                    need_recapture_cuda_graph = True
+                    recv_req.recapture_cuda_graph = False
+                    logger.info("Deferring CUDA graph recapture until after KV cache buffer recreation.")
+
             success, message = self.tp_worker.receive_weights(recv_req)
 
             # Recreate KV cache buffers if we freed them
@@ -318,6 +389,14 @@ class SchedulerUpdateWeightsMixin:
                 logger.info("Recreating KV cache buffers after weight update...")
                 kv_cache._create_buffers()
                 logger.info("KV cache buffers recreated successfully.")
+
+                # Now recapture CUDA graphs if needed (buffers are available now)
+                if need_recapture_cuda_graph and success:
+                    model_runner = self.tp_worker.model_runner
+                    if model_runner.device == "cuda" and not model_runner.server_args.disable_cuda_graph:
+                        logger.info("Recapturing CUDA graphs after KV cache buffer recreation...")
+                        model_runner.init_device_graphs()
+                        logger.info("CUDA graph recapture complete.")
 
             if success and recv_req.flush_cache:
                 flush_cache_success = self.flush_cache()

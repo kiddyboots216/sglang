@@ -32,6 +32,8 @@ from sglang.srt.managers.io_struct import (
     CompleteRDMAWeightUpdateReqOutput,
     CompleteWeightsUpdateReqInput,
     CompleteWeightsUpdateReqOutput,
+    DebugWeightReqInput,
+    DebugWeightReqOutput,
     DestroyWeightsUpdateGroupReqInput,
     DestroyWeightsUpdateGroupReqOutput,
     ExpertDistributionReq,
@@ -53,6 +55,8 @@ from sglang.srt.managers.io_struct import (
     InitWeightsSendGroupForRemoteInstanceReqOutput,
     InitWeightsUpdateGroupReqInput,
     InitWeightsUpdateGroupReqOutput,
+    ListWeightsReqInput,
+    ListWeightsReqOutput,
     LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterFromTensorsReqOutput,
     LoadLoRAAdapterReqInput,
@@ -215,6 +219,8 @@ class TokenizerCommunicatorMixin:
             self.send_to_scheduler, server_args.dp_size
         )
         # RDMA direct weight update communicators
+        # Note: RDMA addresses are per-TP-rank, but the PUSH socket only delivers
+        # to one scheduler. The scheduler aggregates addresses from all TP ranks at startup.
         self.get_rdma_weight_addresses_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
@@ -222,6 +228,12 @@ class TokenizerCommunicatorMixin:
             self.send_to_scheduler, server_args.dp_size
         )
         self.complete_rdma_weight_update_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
+        self.debug_weight_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
+        self.list_weights_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
         self.slow_down_communicator = _Communicator(
@@ -327,6 +339,14 @@ class TokenizerCommunicatorMixin:
                 (
                     CompleteRDMAWeightUpdateReqOutput,
                     self.complete_rdma_weight_update_communicator.handle_recv,
+                ),
+                (
+                    DebugWeightReqOutput,
+                    self.debug_weight_communicator.handle_recv,
+                ),
+                (
+                    ListWeightsReqOutput,
+                    self.list_weights_communicator.handle_recv,
                 ),
                 (
                     SlowDownReqOutput,
@@ -579,18 +599,34 @@ class TokenizerCommunicatorMixin:
         """Get RDMA-accessible weight addresses for direct GPU writes.
 
         Returns weight memory addresses that can be used for RDMA PUSH model updates.
+        Each TP rank has different GPU addresses for its weight shard, so we need to
+        filter results by the requested tp_rank.
+
+        Args:
+            obj: Request input (optional weight_names filter)
+            rank: The TP rank to get addresses for (0 to tp_size-1)
+
+        Returns:
+            Dict with success, message, rdma_session_id, rdma_addr, and weights for the requested rank.
         """
         self.auto_create_handle_loop()
 
-        # For RDMA addresses, we want the result from a specific rank
-        # Send to all schedulers but only use result from the requested rank
+        # Send to all schedulers (tp_size * dp_size) and collect responses
         results = await self.get_rdma_weight_addresses_communicator(obj)
 
-        # Return the result (merged across DP ranks if applicable)
-        if results and len(results) > 0:
-            # Return the first successful result
-            for result in results:
-                if hasattr(result, "success") and result.success:
+        if not results or len(results) == 0:
+            return {
+                "success": False,
+                "message": "No response from scheduler",
+                "rdma_session_id": "",
+                "rdma_addr": "",
+                "weights": {},
+            }
+
+        # Filter results by the requested tp_rank
+        for result in results:
+            if hasattr(result, "success") and result.success:
+                if hasattr(result, "tp_rank") and result.tp_rank == rank:
                     return {
                         "success": result.success,
                         "message": result.message,
@@ -598,18 +634,30 @@ class TokenizerCommunicatorMixin:
                         "rdma_addr": result.rdma_addr,
                         "weights": result.weights,
                     }
-            # If no success, return the first result's error
-            result = results[0]
-            return {
-                "success": result.success,
-                "message": result.message,
-                "rdma_session_id": "",
-                "rdma_addr": "",
-                "weights": {},
-            }
+
+        # If no exact rank match found, check if any result succeeded
+        # This handles backward compatibility where tp_rank might not be set
+        for result in results:
+            if hasattr(result, "success") and result.success:
+                # Log warning that we're returning potentially wrong rank
+                import logging
+                logging.warning(
+                    f"get_rdma_weight_addresses: Requested rank {rank} not found in responses, "
+                    f"returning first successful result (tp_rank={getattr(result, 'tp_rank', 'unknown')})"
+                )
+                return {
+                    "success": result.success,
+                    "message": result.message,
+                    "rdma_session_id": result.rdma_session_id,
+                    "rdma_addr": result.rdma_addr,
+                    "weights": result.weights,
+                }
+
+        # All results failed, return the first error
+        result = results[0]
         return {
-            "success": False,
-            "message": "No response from scheduler",
+            "success": result.success,
+            "message": result.message,
             "rdma_session_id": "",
             "rdma_addr": "",
             "weights": {},
@@ -663,6 +711,124 @@ class TokenizerCommunicatorMixin:
             return success, message
         finally:
             self._weight_update_in_progress = False
+
+    async def debug_weight(
+        self: TokenizerManager,
+        obj: DebugWeightReqInput,
+        rank: int = 0,
+    ) -> Dict[str, Any]:
+        """Get detailed debug info about a specific weight tensor.
+
+        Used to verify RDMA weight sync by comparing tensor values before/after transfer.
+
+        Args:
+            obj: Request input with weight name
+            rank: The TP rank to get info from (0 to tp_size-1)
+
+        Returns:
+            Dict with success, name, shape, dtype, data_ptr, checksum, first/last values.
+        """
+        self.auto_create_handle_loop()
+
+        results = await self.debug_weight_communicator(obj)
+
+        if not results or len(results) == 0:
+            return {
+                "success": False,
+                "message": "No response from scheduler",
+            }
+
+        # Filter results by the requested tp_rank
+        for result in results:
+            if hasattr(result, "success") and result.success:
+                if hasattr(result, "tp_rank") and result.tp_rank == rank:
+                    return {
+                        "success": result.success,
+                        "message": result.message,
+                        "name": result.name,
+                        "shape": result.shape,
+                        "dtype": result.dtype,
+                        "data_ptr": result.data_ptr,
+                        "checksum": result.checksum,
+                        "first_values": result.first_values,
+                        "last_values": result.last_values,
+                    }
+
+        # If no exact rank match, return first successful result
+        for result in results:
+            if hasattr(result, "success") and result.success:
+                return {
+                    "success": result.success,
+                    "message": result.message,
+                    "name": result.name,
+                    "shape": result.shape,
+                    "dtype": result.dtype,
+                    "data_ptr": result.data_ptr,
+                    "checksum": result.checksum,
+                    "first_values": result.first_values,
+                    "last_values": result.last_values,
+                }
+
+        # All results failed
+        result = results[0]
+        return {
+            "success": result.success,
+            "message": result.message,
+        }
+
+    async def list_weights(
+        self: TokenizerManager,
+        obj: ListWeightsReqInput,
+        rank: int = 0,
+    ) -> Dict[str, Any]:
+        """List all weight names in the model.
+
+        Used to verify weight name mapping between training and inference servers.
+
+        Args:
+            obj: Request input with optional prefix filter
+            rank: The TP rank to get info from (0 to tp_size-1)
+
+        Returns:
+            Dict with success, weights list [{name, shape, data_ptr}].
+        """
+        self.auto_create_handle_loop()
+
+        results = await self.list_weights_communicator(obj)
+
+        if not results or len(results) == 0:
+            return {
+                "success": False,
+                "message": "No response from scheduler",
+                "weights": [],
+            }
+
+        # Filter results by the requested tp_rank
+        for result in results:
+            if hasattr(result, "success") and result.success:
+                if hasattr(result, "tp_rank") and result.tp_rank == rank:
+                    return {
+                        "success": result.success,
+                        "message": result.message,
+                        "weights": result.weights,
+                    }
+
+        # If no exact rank match, return first successful result
+        for result in results:
+            if hasattr(result, "success") and result.success:
+                return {
+                    "success": result.success,
+                    "message": result.message,
+                    "weights": result.weights,
+                }
+
+        # All results failed
+        result = results[0]
+        return {
+            "success": result.success,
+            "message": result.message,
+            "weights": [],
+        }
 
     async def receive_weights(
         self: TokenizerManager,

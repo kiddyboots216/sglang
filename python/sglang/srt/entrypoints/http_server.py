@@ -99,11 +99,13 @@ from sglang.srt.managers.io_struct import (
     CompleteWeightsUpdateReqInput,
     ConfigureLoggingReq,
     ContinueGenerationReqInput,
+    DebugWeightReqInput,
     DestroyWeightsUpdateGroupReqInput,
     EmbeddingReqInput,
     GenerateReqInput,
     GetRDMAWeightAddressesReqInput,
     GetWeightsByNameReqInput,
+    ListWeightsReqInput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsUpdateGroupReqInput,
     LoadLoRAAdapterFromTensorsReqInput,
@@ -928,10 +930,46 @@ async def get_rdma_weight_addresses(rank: int = None):
         return Response(status_code=HTTPStatus.BAD_REQUEST)
 
     try:
-        result = await _global_state.tokenizer_manager.get_rdma_weight_addresses(
-            GetRDMAWeightAddressesReqInput(), rank
-        )
-        return ORJSONResponse(result, status_code=200 if result.get("success", False) else HTTPStatus.BAD_REQUEST)
+        # Use cached transfer engine info from startup (contains all TP ranks)
+        # This avoids the ZMQ round-trip and ensures we return the correct rank's addresses
+        transfer_engine_info = _global_state.remote_instance_transfer_engine_info
+
+        if transfer_engine_info is None or rank not in transfer_engine_info:
+            # Fall back to the old method if cache is not available
+            result = await _global_state.tokenizer_manager.get_rdma_weight_addresses(
+                GetRDMAWeightAddressesReqInput(), rank
+            )
+            return ORJSONResponse(result, status_code=200 if result.get("success", False) else HTTPStatus.BAD_REQUEST)
+
+        # Get info for the requested rank from the cache
+        session_id, weights_dict = transfer_engine_info[rank]
+
+        # Convert weights_dict to the expected format
+        # weights_dict is {name: (data_ptr, numel, element_size, shape, dtype)} or older 3-element format
+        formatted_weights = {}
+        for name, info in weights_dict.items():
+            if len(info) >= 5:
+                data_ptr, numel, element_size, shape, dtype_str = info[:5]
+            else:
+                data_ptr, numel, element_size = info[:3]
+                shape = []
+                dtype_str = "bfloat16"
+            formatted_weights[name] = {
+                "data_ptr": data_ptr,
+                "numel": numel,
+                "element_size": element_size,
+                "dtype": dtype_str,
+                "shape": shape,
+            }
+
+        result = {
+            "success": True,
+            "message": f"Found {len(formatted_weights)} weights",
+            "rdma_session_id": session_id,
+            "rdma_addr": session_id,
+            "weights": formatted_weights,
+        }
+        return ORJSONResponse(result, status_code=200)
     except Exception as e:
         logger.error(f"get_rdma_weight_addresses failed: {e}")
         return ORJSONResponse(
@@ -981,6 +1019,60 @@ async def complete_rdma_weight_update(
         return ORJSONResponse(content, status_code=200 if success else HTTPStatus.BAD_REQUEST)
     except Exception as e:
         logger.error(f"complete_rdma_weight_update failed: {e}")
+        return ORJSONResponse(
+            {"success": False, "message": str(e)},
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR
+        )
+
+
+@app.get("/debug_weight")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def debug_weight(name: str, rank: int = 0):
+    """Get detailed debug info about a specific weight tensor.
+
+    Used to verify RDMA weight sync by comparing tensor values before/after transfer.
+
+    Args:
+        name: Weight name (e.g., "model.layers.0.input_layernorm.weight")
+        rank: The TP rank to get info from (default 0)
+
+    Returns:
+        JSON with weight details: shape, dtype, data_ptr, checksum, first/last values.
+    """
+    try:
+        result = await _global_state.tokenizer_manager.debug_weight(
+            DebugWeightReqInput(name=name), rank
+        )
+        return ORJSONResponse(result, status_code=200 if result.get("success", False) else HTTPStatus.BAD_REQUEST)
+    except Exception as e:
+        logger.error(f"debug_weight failed: {e}")
+        return ORJSONResponse(
+            {"success": False, "message": str(e)},
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR
+        )
+
+
+@app.get("/list_weights")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def list_weights(prefix: str = None, rank: int = 0):
+    """List all weight names in the model.
+
+    Used to verify weight name mapping between training and inference servers.
+
+    Args:
+        prefix: Optional filter prefix (e.g., "model.layers.0")
+        rank: The TP rank to get info from (default 0)
+
+    Returns:
+        JSON with list of weights: [{name, shape, data_ptr}].
+    """
+    try:
+        result = await _global_state.tokenizer_manager.list_weights(
+            ListWeightsReqInput(prefix=prefix), rank
+        )
+        return ORJSONResponse(result, status_code=200 if result.get("success", False) else HTTPStatus.BAD_REQUEST)
+    except Exception as e:
+        logger.error(f"list_weights failed: {e}")
         return ORJSONResponse(
             {"success": False, "message": str(e)},
             status_code=HTTPStatus.INTERNAL_SERVER_ERROR
