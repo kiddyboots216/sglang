@@ -1421,6 +1421,54 @@ class ReceiveWeightsReqOutput(BaseReq):
 
 
 @dataclass
+class ReceiveWeightsEPScatterReqInput(BaseReq):
+    """Receive weights from multiple EP training ranks via NCCL batch_isend_irecv.
+
+    Unlike scatter (single sender), this receives from ALL training ranks in parallel.
+    Each EP rank sends its local expert weights to all TP inference ranks.
+
+    The transfer plans provide exact buffer shapes for NCCL P2P, which requires
+    sender and receiver buffers to have identical shapes.
+    """
+
+    weight_names: List[str]  # Unique weight names to receive (legacy, for compatibility)
+    group_name: str = "ep_scatter_group"
+    training_world_size: int = 8  # Number of EP training ranks
+    num_experts_per_rank: int = 16  # Experts per training rank
+    total_num_experts: int = 128  # Total experts = training_world_size * num_experts_per_rank
+    inference_tp_size: int = 8  # TP size on inference side
+    flush_cache: bool = True
+    free_kv_cache_before_recv: bool = False
+    recapture_cuda_graph: bool = False
+    # NCCL group initialization params (passed from training rank 0)
+    master_address: Optional[str] = None  # Training master IP for rendezvous
+    master_port: Optional[int] = None  # TCP port for rendezvous
+    # Structured transfer plans with exact buffer shapes
+    # expert_transfer_plan: List of dicts with keys:
+    #   - weight_name: str
+    #   - is_expert_weight: bool
+    #   - transfers_per_weight: int (number of EP ranks sending this weight)
+    #   - per_transfer_shape: List[int] (exact shape of each partial send)
+    #   - expert_ranges: Dict[int, Dict] mapping ep_rank to {"start", "end", "source_nccl_rank"}
+    expert_transfer_plan: Optional[List[Dict]] = None
+    # non_expert_transfer_plan: List of dicts with keys:
+    #   - weight_name: str
+    #   - is_expert_weight: bool
+    #   - transfers_per_weight: int (always 1)
+    #   - source_nccl_rank: int (always 0)
+    #   - per_transfer_shape: List[int] (TP-sharded shape)
+    non_expert_transfer_plan: Optional[List[Dict]] = None
+    # Batch size for non-expert weight transfers (to avoid OOM by processing in chunks)
+    non_expert_batch_size: int = 50
+
+
+@dataclass
+class ReceiveWeightsEPScatterReqOutput(BaseReq):
+    success: bool
+    message: str
+
+
+@dataclass
 class InitWeightsSendGroupForRemoteInstanceReqInput(BaseReq):
     # The master address
     master_address: str

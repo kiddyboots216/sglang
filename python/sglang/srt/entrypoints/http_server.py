@@ -116,6 +116,7 @@ from sglang.srt.managers.io_struct import (
     PrepareRDMAWeightUpdateReqInput,
     PrepareWeightsUpdateReqInput,
     ProfileReqInput,
+    ReceiveWeightsEPScatterReqInput,
     ReceiveWeightsReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
@@ -1197,6 +1198,25 @@ async def update_weights_from_scattered(
         return ORJSONResponse(content, status_code=200)
     else:
         return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
+
+
+@app.post("/receive_weights_ep_scatter")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def receive_weights_ep_scatter(
+    obj: ReceiveWeightsEPScatterReqInput, request: Request
+):
+    """Receive weights from multiple EP training ranks via NCCL P2P scatter.
+
+    This endpoint enables parallel weight transfer where all EP training ranks
+    simultaneously send their local expert weights to all TP inference ranks.
+    """
+    success, message = (
+        await _global_state.tokenizer_manager.receive_weights_ep_scatter(obj, request)
+    )
+    content = {"success": success, "message": message}
+    return ORJSONResponse(
+        content, status_code=200 if success else HTTPStatus.BAD_REQUEST
+    )
 
 
 @app.post("/prepare_weights_update")

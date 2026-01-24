@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 
@@ -35,6 +35,7 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqInput,
     PrepareRDMAWeightUpdateReqInput,
     PrepareWeightsUpdateReqInput,
+    ReceiveWeightsEPScatterReqInput,
     ReceiveWeightsReqInput,
     SendWeightsToRemoteInstanceReqInput,
     UnloadLoRAAdapterReqInput,
@@ -256,6 +257,21 @@ class BaseTpWorker(ABC):
             recapture_cuda_graph=recv_req.recapture_cuda_graph,
         )
         return success, message
+
+    def receive_weights_ep_scatter(
+        self, recv_req: "ReceiveWeightsEPScatterReqInput"
+    ) -> Tuple[bool, str]:
+        """Receive weights from EP ranks via P2P scatter."""
+        return self.model_runner.ep_scatter_receive(
+            recv_req.weight_names,
+            recv_req.group_name,
+            recv_req.training_world_size,
+            recv_req.num_experts_per_rank,
+            recv_req.total_num_experts,
+            expert_transfer_plan=recv_req.expert_transfer_plan,
+            non_expert_transfer_plan=recv_req.non_expert_transfer_plan,
+            non_expert_batch_size=recv_req.non_expert_batch_size,
+        )
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
 

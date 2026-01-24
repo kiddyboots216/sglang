@@ -24,7 +24,7 @@ import threading
 import time
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Callable, List, Optional, Tuple, Union
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -1255,6 +1255,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             logger.error(message)
             return False, message
 
+    def has_weights_update_group(self, group_name: str) -> bool:
+        """Check if a weights update group exists."""
+        return group_name in self._model_update_group
+
     def destroy_weights_update_group(self, group_name):
         try:
             if group_name in self._model_update_group:
@@ -1505,6 +1509,329 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             error_msg = f"Failed to update parameters via scatter: {e}"
             logger.error(error_msg)
             return False, error_msg
+
+    def ep_scatter_receive(
+        self,
+        weight_names: List[str],
+        group_name: str,
+        training_world_size: int,
+        num_experts_per_rank: int,
+        total_num_experts: int,
+        expert_transfer_plan: Optional[List[Dict]] = None,
+        non_expert_transfer_plan: Optional[List[Dict]] = None,
+        non_expert_batch_size: int = 50,
+    ) -> Tuple[bool, str]:
+        """Receive weights from all EP training ranks directly into param.data.
+
+        TRUE IN-PLACE: No intermediate buffers, no load_weights(). Receives directly
+        into model parameter tensors to preserve CUDA graphs and enable zero-copy.
+
+        When transfer plans are provided (preferred):
+        - Uses exact buffer shapes from per_transfer_shape for NCCL P2P compatibility
+        - Expert weights: receive into param.data[start:end] slices based on expert_ranges
+        - Non-expert weights: receive into param.data from rank 0 (in batches)
+
+        Legacy mode (when transfer plans are None):
+        - Falls back to detecting expert weights by naming patterns
+        - Slices param.data based on num_experts_per_rank
+
+        Args:
+            weight_names: List of parameter names to receive (legacy)
+            group_name: NCCL group name
+            training_world_size: Number of EP training ranks (typically 8)
+            num_experts_per_rank: Number of experts per EP training rank (typically 16)
+            total_num_experts: Total experts = training_world_size * num_experts_per_rank
+            expert_transfer_plan: Structured metadata for expert weight transfers
+            non_expert_transfer_plan: Structured metadata for non-expert weight transfers
+            non_expert_batch_size: Batch size for non-expert transfers (to avoid OOM)
+
+        Returns:
+            Tuple of (success, message)
+        """
+        from torch.distributed import P2POp, batch_isend_irecv
+
+        try:
+            torch.cuda.set_device(self.gpu_id)
+
+            if group_name not in self._model_update_group:
+                return False, f"NCCL group {group_name} not initialized"
+            group = self._model_update_group[group_name]
+
+            params_dict = dict(self.model.named_parameters())
+            updated_count = 0
+
+            # Build all P2P receive operations - receive directly into param.data
+            p2p_ops = []
+
+            # Use structured transfer plans if available (preferred)
+            if expert_transfer_plan is not None or non_expert_transfer_plan is not None:
+                # Process expert weights using transfer plan
+                if expert_transfer_plan:
+                    for transfer in expert_transfer_plan:
+                        name = transfer["weight_name"]
+                        if name not in params_dict:
+                            logger.warning(f"[EP_SCATTER] Expert param {name} not found, skipping")
+                            continue
+
+                        param = params_dict[name]
+                        expert_ranges = transfer["expert_ranges"]
+                        per_transfer_shape = transfer["per_transfer_shape"]
+
+                        # Create irecv for each EP rank's portion
+                        for ep_rank_str, range_info in expert_ranges.items():
+                            ep_rank = int(ep_rank_str)  # JSON keys are strings
+                            start = range_info["start"]
+                            end = range_info["end"]
+                            source_rank = range_info["source_nccl_rank"]
+
+                            # Slice param.data to get the exact buffer shape
+                            # param.data shape: [total_experts, dim1, dim2, ...]
+                            # We slice the first dimension (experts) to get [num_local_experts, dim1, dim2, ...]
+                            recv_buffer = param.data[start:end]
+
+                            # Verify shape matches expected per_transfer_shape
+                            expected_shape = per_transfer_shape
+                            actual_shape = list(recv_buffer.shape)
+                            if actual_shape != expected_shape:
+                                logger.warning(
+                                    f"[EP_SCATTER] Shape mismatch for {name} from EP{ep_rank}: "
+                                    f"expected {expected_shape}, got {actual_shape}"
+                                )
+
+                            p2p_ops.append(P2POp(
+                                op=torch.distributed.irecv,
+                                tensor=recv_buffer,
+                                peer=source_rank,
+                                group=group,
+                            ))
+
+                        updated_count += 1
+
+                # Process non-expert weights using transfer plan
+                if non_expert_transfer_plan:
+                    for transfer in non_expert_transfer_plan:
+                        name = transfer["weight_name"]
+                        if name not in params_dict:
+                            logger.warning(f"[EP_SCATTER] Non-expert param {name} not found, skipping")
+                            continue
+
+                        param = params_dict[name]
+                        source_rank = transfer["source_nccl_rank"]
+                        per_transfer_shape = transfer["per_transfer_shape"]
+
+                        # Verify shape matches
+                        actual_shape = list(param.data.shape)
+                        if actual_shape != per_transfer_shape:
+                            logger.warning(
+                                f"[EP_SCATTER] Shape mismatch for {name}: "
+                                f"expected {per_transfer_shape}, got {actual_shape}"
+                            )
+
+                        p2p_ops.append(P2POp(
+                            op=torch.distributed.irecv,
+                            tensor=param.data,
+                            peer=source_rank,
+                            group=group,
+                        ))
+
+                        updated_count += 1
+
+                logger.info(
+                    f"[EP_SCATTER] TP{self.tp_rank}: Using transfer plans - "
+                    f"{len(expert_transfer_plan or [])} expert weights, "
+                    f"{len(non_expert_transfer_plan or [])} non-expert weights"
+                )
+            else:
+                # Legacy mode: detect expert weights by naming patterns
+                logger.info(f"[EP_SCATTER] TP{self.tp_rank}: Using legacy mode (no transfer plans)")
+
+                for name in weight_names:
+                    if name not in params_dict:
+                        logger.warning(f"[EP_SCATTER] Parameter {name} not found, skipping")
+                        continue
+
+                    param = params_dict[name]
+                    # Detect expert weights by common MoE naming patterns
+                    is_expert = ".experts." in name or "w13_weight" in name or "w2_weight" in name
+
+                    if is_expert:
+                        # Expert weights: receive from ALL EP ranks into slices of param.data
+                        # param.data shape: [total_experts, ...] e.g. [128, 192, 2048]
+                        # Each EP rank sends: [num_experts_per_rank, ...] e.g. [16, 192, 2048]
+                        for ep_rank in range(training_world_size):
+                            expert_start = ep_rank * num_experts_per_rank
+                            expert_end = (ep_rank + 1) * num_experts_per_rank
+
+                            # Receive DIRECTLY into the slice of param.data (zero-copy!)
+                            # param.data[start:end] is a contiguous view for dim-0 slicing
+                            recv_slice = param.data[expert_start:expert_end]
+
+                            p2p_ops.append(P2POp(
+                                op=torch.distributed.irecv,
+                                tensor=recv_slice,
+                                peer=ep_rank,  # Training EP ranks are global ranks 0 to (training_world_size-1)
+                                group=group,
+                            ))
+                    else:
+                        # Non-expert weights: receive from rank 0 directly into param.data
+                        p2p_ops.append(P2POp(
+                            op=torch.distributed.irecv,
+                            tensor=param.data,  # Receive directly into param.data!
+                            peer=0,
+                            group=group,
+                        ))
+
+                    updated_count += 1
+
+            # TWO-PHASE TRANSFER to avoid OOM on sender side:
+            # - Phase 1: Expert weights (received from all EP ranks)
+            # - Phase 2: Non-expert weights (received from rank 0 only)
+            # This matches Tomni's two-phase approach.
+
+            # Build separate op lists for two-phase transfer
+            expert_p2p_ops = []
+            non_expert_p2p_ops = []
+
+            # Classify ops into expert vs non-expert based on transfer plans
+            if expert_transfer_plan is not None or non_expert_transfer_plan is not None:
+                # With transfer plans: already built ops above, but we need to rebuild
+                # separately for each phase. Clear p2p_ops and rebuild.
+                p2p_ops = []  # Clear - we'll rebuild below
+                updated_count = 0
+
+                # Process expert weights using transfer plan -> expert_p2p_ops
+                if expert_transfer_plan:
+                    for transfer in expert_transfer_plan:
+                        name = transfer["weight_name"]
+                        if name not in params_dict:
+                            continue
+
+                        param = params_dict[name]
+                        expert_ranges = transfer["expert_ranges"]
+
+                        for ep_rank_str, range_info in expert_ranges.items():
+                            ep_rank = int(ep_rank_str)
+                            start = range_info["start"]
+                            end = range_info["end"]
+                            source_rank = range_info["source_nccl_rank"]
+
+                            recv_buffer = param.data[start:end]
+                            expert_p2p_ops.append(P2POp(
+                                op=torch.distributed.irecv,
+                                tensor=recv_buffer,
+                                peer=source_rank,
+                                group=group,
+                            ))
+
+                        updated_count += 1
+
+                # Non-expert weights are processed in Phase 2 (batched)
+                # Just count them for now; actual ops are built in Phase 2
+                if non_expert_transfer_plan:
+                    for transfer in non_expert_transfer_plan:
+                        name = transfer["weight_name"]
+                        if name in params_dict:
+                            updated_count += 1
+            else:
+                # Legacy mode: classify based on naming patterns
+                for name in weight_names:
+                    if name not in params_dict:
+                        continue
+
+                    param = params_dict[name]
+                    is_expert = ".experts." in name or "w13_weight" in name or "w2_weight" in name
+
+                    if is_expert:
+                        for ep_rank in range(training_world_size):
+                            expert_start = ep_rank * num_experts_per_rank
+                            expert_end = (ep_rank + 1) * num_experts_per_rank
+                            recv_slice = param.data[expert_start:expert_end]
+                            expert_p2p_ops.append(P2POp(
+                                op=torch.distributed.irecv,
+                                tensor=recv_slice,
+                                peer=ep_rank,
+                                group=group,
+                            ))
+                    else:
+                        non_expert_p2p_ops.append(P2POp(
+                            op=torch.distributed.irecv,
+                            tensor=param.data,
+                            peer=0,
+                            group=group,
+                        ))
+
+                    updated_count += 1
+
+            # ========== PHASE 1: Expert Weights ==========
+            if expert_p2p_ops:
+                logger.info(f"[EP_SCATTER] TP{self.tp_rank}: PHASE 1 - Executing {len(expert_p2p_ops)} expert irecv ops")
+                reqs = batch_isend_irecv(expert_p2p_ops)
+                for req in reqs:
+                    req.wait()
+                torch.cuda.synchronize()
+                logger.info(f"[EP_SCATTER] TP{self.tp_rank}: PHASE 1 complete - Expert weights received")
+
+            # ========== PHASE 2: Non-Expert Weights (in sub-batches) ==========
+            # Process non-expert weights in batches to match Tomni's batched sending.
+            # This must use the same batch size as Tomni to ensure ops match.
+            if non_expert_transfer_plan:
+                # Use transfer plan for batched processing
+                num_non_expert = len(non_expert_transfer_plan)
+                num_batches = (num_non_expert + non_expert_batch_size - 1) // non_expert_batch_size
+
+                logger.info(
+                    f"[EP_SCATTER] TP{self.tp_rank}: PHASE 2 - Processing {num_non_expert} non-expert weights "
+                    f"in {num_batches} batches of {non_expert_batch_size}"
+                )
+
+                for batch_idx in range(num_batches):
+                    start_idx = batch_idx * non_expert_batch_size
+                    end_idx = min(start_idx + non_expert_batch_size, num_non_expert)
+                    batch_transfers = non_expert_transfer_plan[start_idx:end_idx]
+
+                    batch_ops = []
+                    for transfer in batch_transfers:
+                        name = transfer["weight_name"]
+                        if name not in params_dict:
+                            continue
+
+                        param = params_dict[name]
+                        source_rank = transfer["source_nccl_rank"]
+
+                        batch_ops.append(P2POp(
+                            op=torch.distributed.irecv,
+                            tensor=param.data,
+                            peer=source_rank,
+                            group=group,
+                        ))
+
+                    if batch_ops:
+                        logger.info(
+                            f"[EP_SCATTER] TP{self.tp_rank}: PHASE 2 batch {batch_idx+1}/{num_batches}: "
+                            f"{len(batch_ops)} irecv ops"
+                        )
+                        reqs = batch_isend_irecv(batch_ops)
+                        for req in reqs:
+                            req.wait()
+                        torch.cuda.synchronize()
+
+                logger.info(f"[EP_SCATTER] TP{self.tp_rank}: PHASE 2 complete - Non-expert weights received")
+
+            elif non_expert_p2p_ops:
+                # Legacy mode: process pre-built ops in a single batch
+                # Note: Legacy mode doesn't support batching since Tomni legacy also doesn't batch
+                logger.info(f"[EP_SCATTER] TP{self.tp_rank}: PHASE 2 (legacy) - Executing {len(non_expert_p2p_ops)} non-expert irecv ops")
+                reqs = batch_isend_irecv(non_expert_p2p_ops)
+                for req in reqs:
+                    req.wait()
+                torch.cuda.synchronize()
+                logger.info(f"[EP_SCATTER] TP{self.tp_rank}: PHASE 2 (legacy) complete - Non-expert weights received")
+
+            return True, f"Updated {updated_count} params in-place from {training_world_size} EP ranks (2-phase batched)"
+
+        except Exception as e:
+            logger.error(f"EP scatter receive failed: {e}", exc_info=True)
+            return False, str(e)
 
     def prepare_weights_update(
         self,

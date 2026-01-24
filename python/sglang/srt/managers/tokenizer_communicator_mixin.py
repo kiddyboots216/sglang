@@ -70,6 +70,8 @@ from sglang.srt.managers.io_struct import (
     ProfileReq,
     ProfileReqOutput,
     ProfileReqType,
+    ReceiveWeightsEPScatterReqInput,
+    ReceiveWeightsEPScatterReqOutput,
     ReceiveWeightsReqInput,
     ReceiveWeightsReqOutput,
     ReleaseMemoryOccupationReqInput,
@@ -203,6 +205,9 @@ class TokenizerCommunicatorMixin:
         self.receive_weights_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
+        self.receive_weights_ep_scatter_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
         self.init_weights_send_group_for_remote_instance_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
@@ -308,6 +313,10 @@ class TokenizerCommunicatorMixin:
                 (
                     ReceiveWeightsReqOutput,
                     self.receive_weights_communicator.handle_recv,
+                ),
+                (
+                    ReceiveWeightsEPScatterReqOutput,
+                    self.receive_weights_ep_scatter_communicator.handle_recv,
                 ),
                 (
                     InitWeightsSendGroupForRemoteInstanceReqOutput,
@@ -937,6 +946,25 @@ class TokenizerCommunicatorMixin:
             return success, message
         except Exception as e:
             logger.error(f"receive_weights failed: {e}")
+            return False, str(e)
+
+    async def receive_weights_ep_scatter(
+        self: TokenizerManager,
+        obj: ReceiveWeightsEPScatterReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> Tuple[bool, str]:
+        """Receive weights from EP ranks via P2P scatter."""
+        self.auto_create_handle_loop()
+        assert (
+            self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
+        ), "dp_size must be 1 or dp attention must be enabled for receive weights"
+
+        try:
+            results = await self.receive_weights_ep_scatter_communicator(obj)
+            success, message = _Communicator.merge_results(results)
+            return success, message
+        except Exception as e:
+            logger.error(f"receive_weights_ep_scatter failed: {e}")
             return False, str(e)
 
     async def init_weights_send_group_for_remote_instance(

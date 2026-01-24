@@ -35,6 +35,8 @@ from sglang.srt.managers.io_struct import (
     PrepareRDMAWeightUpdateReqOutput,
     PrepareWeightsUpdateReqInput,
     PrepareWeightsUpdateReqOutput,
+    ReceiveWeightsEPScatterReqInput,
+    ReceiveWeightsEPScatterReqOutput,
     ReceiveWeightsReqInput,
     ReceiveWeightsReqOutput,
     ReleaseMemoryOccupationReqInput,
@@ -469,6 +471,74 @@ class SchedulerUpdateWeightsMixin:
             return ReceiveWeightsReqOutput(success=False, message=str(e))
 
         return ReceiveWeightsReqOutput(success=success, message=message)
+
+    def receive_weights_ep_scatter(
+        self,
+        recv_req: ReceiveWeightsEPScatterReqInput,
+    ) -> ReceiveWeightsEPScatterReqOutput:
+        """Receive weights from multiple EP training ranks.
+
+        This handler will auto-initialize the NCCL group if it doesn't exist
+        and master_address/master_port are provided.
+        """
+        try:
+            # Check if we need to initialize the NCCL group first
+            group_exists = self.tp_worker.model_runner.has_weights_update_group(
+                recv_req.group_name
+            )
+
+            if not group_exists:
+                # Need to initialize the group
+                if recv_req.master_address is None or recv_req.master_port is None:
+                    return ReceiveWeightsEPScatterReqOutput(
+                        success=False,
+                        message=f"NCCL group '{recv_req.group_name}' not initialized and "
+                        "master_address/master_port not provided for auto-init",
+                    )
+
+                logger.info(
+                    f"Auto-initializing NCCL group '{recv_req.group_name}' for EP scatter"
+                )
+
+                # Pause detokenizer before NCCL init
+                self.send_to_detokenizer.send_output(WeightUpdatePauseReq(), recv_req)
+
+                try:
+                    # Initialize the group
+                    # For EP scatter: inference ranks are training_world_size to training_world_size+tp_size-1
+                    # rank_offset = training_world_size so that inference TP0 = global rank training_world_size
+                    total_world_size = recv_req.training_world_size + self.tp_size
+                    init_success, init_msg = self.tp_worker.model_runner.init_weights_update_group(
+                        master_address=recv_req.master_address,
+                        master_port=recv_req.master_port,
+                        rank_offset=recv_req.training_world_size,  # Inference ranks start after training ranks
+                        world_size=total_world_size,
+                        group_name=recv_req.group_name,
+                        backend="nccl",
+                    )
+                    if not init_success:
+                        self.send_to_detokenizer.send_output(WeightUpdateResumeReq(), recv_req)
+                        return ReceiveWeightsEPScatterReqOutput(
+                            success=False,
+                            message=f"Failed to init NCCL group: {init_msg}",
+                        )
+                    logger.info(f"NCCL group initialized: {init_msg}")
+                finally:
+                    # Resume detokenizer after NCCL init
+                    self.send_to_detokenizer.send_output(WeightUpdateResumeReq(), recv_req)
+
+            # Now do the actual P2P receives
+            success, message = self.tp_worker.receive_weights_ep_scatter(recv_req)
+
+            if success and recv_req.flush_cache:
+                flush_success = self.flush_cache()
+                if not flush_success:
+                    message += " (warning: cache flush failed)"
+
+            return ReceiveWeightsEPScatterReqOutput(success=success, message=message)
+        except Exception as e:
+            logger.error(f"EP scatter receive failed: {e}", exc_info=True)
+            return ReceiveWeightsEPScatterReqOutput(success=False, message=str(e))
 
     def update_weights_from_tensor(
         self: Scheduler, recv_req: UpdateWeightsFromTensorReqInput
