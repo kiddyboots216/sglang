@@ -95,15 +95,12 @@ from sglang.srt.managers.io_struct import (
     AbortReq,
     CheckWeightsReqInput,
     CloseSessionReqInput,
-    CompleteRDMAWeightUpdateReqInput,
     CompleteWeightsUpdateReqInput,
     ConfigureLoggingReq,
     ContinueGenerationReqInput,
-    DebugWeightReqInput,
     DestroyWeightsUpdateGroupReqInput,
     EmbeddingReqInput,
     GenerateReqInput,
-    GetRDMAWeightAddressesReqInput,
     GetWeightsByNameReqInput,
     ListWeightsReqInput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
@@ -113,7 +110,6 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqInput,
     ParseFunctionCallReq,
     PauseGenerationReqInput,
-    PrepareRDMAWeightUpdateReqInput,
     PrepareWeightsUpdateReqInput,
     ProfileReqInput,
     ReceiveWeightsEPScatterReqInput,
@@ -126,9 +122,7 @@ from sglang.srt.managers.io_struct import (
     SlowDownReqInput,
     UnloadLoRAAdapterReqInput,
     UpdateWeightFromDiskReqInput,
-    UpdateWeightsFromDistributedInplaceReqInput,
     UpdateWeightsFromDistributedReqInput,
-    UpdateWeightsFromScatteredReqInput,
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightVersionReqInput,
@@ -913,148 +907,6 @@ async def get_remote_instance_transfer_engine_info(rank: int = None):
         return Response(status_code=HTTPStatus.BAD_REQUEST)
 
 
-@app.get("/get_rdma_weight_addresses")
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def get_rdma_weight_addresses(rank: int = None):
-    """Get RDMA-accessible weight addresses for direct GPU writes.
-
-    This endpoint returns the GPU memory addresses of model weights, allowing
-    training servers to perform RDMA writes directly to inference GPU memory.
-
-    Args:
-        rank: The TP rank to get addresses for. If None, uses rank 0.
-
-    Returns:
-        JSON with RDMA session info and weight addresses.
-    """
-    if rank is None:
-        rank = 0
-    if rank < 0:
-        return Response(status_code=HTTPStatus.BAD_REQUEST)
-
-    try:
-        # Use cached transfer engine info from startup (contains all TP ranks)
-        # This avoids the ZMQ round-trip and ensures we return the correct rank's addresses
-        transfer_engine_info = _global_state.remote_instance_transfer_engine_info
-
-        if transfer_engine_info is None or rank not in transfer_engine_info:
-            # Fall back to the old method if cache is not available
-            result = await _global_state.tokenizer_manager.get_rdma_weight_addresses(
-                GetRDMAWeightAddressesReqInput(), rank
-            )
-            return ORJSONResponse(result, status_code=200 if result.get("success", False) else HTTPStatus.BAD_REQUEST)
-
-        # Get info for the requested rank from the cache
-        session_id, weights_dict = transfer_engine_info[rank]
-
-        # Convert weights_dict to the expected format
-        # weights_dict is {name: (data_ptr, numel, element_size, shape, dtype)} or older 3-element format
-        formatted_weights = {}
-        for name, info in weights_dict.items():
-            if len(info) >= 5:
-                data_ptr, numel, element_size, shape, dtype_str = info[:5]
-            else:
-                data_ptr, numel, element_size = info[:3]
-                shape = []
-                dtype_str = "bfloat16"
-            formatted_weights[name] = {
-                "data_ptr": data_ptr,
-                "numel": numel,
-                "element_size": element_size,
-                "dtype": dtype_str,
-                "shape": shape,
-            }
-
-        result = {
-            "success": True,
-            "message": f"Found {len(formatted_weights)} weights",
-            "rdma_session_id": session_id,
-            "rdma_addr": session_id,
-            "weights": formatted_weights,
-        }
-        return ORJSONResponse(result, status_code=200)
-    except Exception as e:
-        logger.error(f"get_rdma_weight_addresses failed: {e}")
-        return ORJSONResponse(
-            {"success": False, "message": str(e)},
-            status_code=HTTPStatus.INTERNAL_SERVER_ERROR
-        )
-
-
-@app.post("/prepare_rdma_weight_update")
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def prepare_rdma_weight_update(
-    obj: PrepareRDMAWeightUpdateReqInput, request: Request
-):
-    """Prepare for RDMA weight update.
-
-    This pauses inference and synchronizes CUDA to ensure weights are not being accessed.
-    Call this before performing RDMA writes to weight memory.
-    """
-    try:
-        success, message = await _global_state.tokenizer_manager.prepare_rdma_weight_update(
-            obj, request
-        )
-        content = {"success": success, "message": message, "status": "ready" if success else "error"}
-        return ORJSONResponse(content, status_code=200 if success else HTTPStatus.BAD_REQUEST)
-    except Exception as e:
-        logger.error(f"prepare_rdma_weight_update failed: {e}")
-        return ORJSONResponse(
-            {"success": False, "message": str(e), "status": "error"},
-            status_code=HTTPStatus.INTERNAL_SERVER_ERROR
-        )
-
-
-@app.post("/complete_rdma_weight_update")
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def complete_rdma_weight_update(
-    obj: CompleteRDMAWeightUpdateReqInput, request: Request
-):
-    """Complete RDMA weight update.
-
-    Called after RDMA writes are done to synchronize and resume inference.
-    """
-    try:
-        success, message = await _global_state.tokenizer_manager.complete_rdma_weight_update(
-            obj, request
-        )
-        content = {"success": success, "message": message}
-        return ORJSONResponse(content, status_code=200 if success else HTTPStatus.BAD_REQUEST)
-    except Exception as e:
-        logger.error(f"complete_rdma_weight_update failed: {e}")
-        return ORJSONResponse(
-            {"success": False, "message": str(e)},
-            status_code=HTTPStatus.INTERNAL_SERVER_ERROR
-        )
-
-
-@app.get("/debug_weight")
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def debug_weight(name: str, rank: int = 0):
-    """Get detailed debug info about a specific weight tensor.
-
-    Used to verify RDMA weight sync by comparing tensor values before/after transfer.
-
-    Args:
-        name: Weight name (e.g., "model.layers.0.input_layernorm.weight")
-        rank: The TP rank to get info from (default 0)
-
-    Returns:
-        JSON with weight details: shape, dtype, data_ptr, checksum, first/last values.
-    """
-    try:
-        result = await _global_state.tokenizer_manager.debug_weight(
-            DebugWeightReqInput(name=name), rank
-        )
-        return ORJSONResponse(result, status_code=200 if result.get("success", False) else HTTPStatus.BAD_REQUEST)
-    except Exception as e:
-        logger.error(f"debug_weight failed: {e}")
-        return ORJSONResponse(
-            {"success": False, "message": str(e)},
-            status_code=HTTPStatus.INTERNAL_SERVER_ERROR
-        )
-
-
 @app.get("/list_weights")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def list_weights(prefix: str = None, rank: int = 0):
@@ -1143,52 +995,6 @@ async def update_weights_from_distributed(
     """Update model parameter from distributed online."""
     success, message = (
         await _global_state.tokenizer_manager.update_weights_from_distributed(
-            obj, request
-        )
-    )
-
-    content = {"success": success, "message": message}
-    if success:
-        return ORJSONResponse(content, status_code=200)
-    else:
-        return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
-
-
-@app.post("/update_weights_from_distributed_inplace")
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def update_weights_from_distributed_inplace(
-    obj: UpdateWeightsFromDistributedInplaceReqInput, request: Request
-):
-    """Update model weights in-place via NCCL broadcast (zero-copy, no temp buffers)."""
-    success, message = (
-        await _global_state.tokenizer_manager.update_weights_from_distributed_inplace(
-            obj, request
-        )
-    )
-
-    content = {"success": success, "message": message}
-    if success:
-        return ORJSONResponse(content, status_code=200)
-    else:
-        return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
-
-
-@app.post("/update_weights_from_scattered")
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def update_weights_from_scattered(
-    obj: UpdateWeightsFromScatteredReqInput, request: Request
-):
-    """Update model weights in-place via NCCL scatter for TP>1.
-
-    Unlike broadcast (which sends identical data to all ranks), scatter sends
-    different TP shards to each rank. This enables zero-copy in-place updates
-    for tensor-parallel models while preserving CUDA graphs.
-
-    The training side (rank 0) pre-shards weights and uses NCCL scatter to send
-    different shards to each inference rank directly into param.data.
-    """
-    success, message = (
-        await _global_state.tokenizer_manager.update_weights_from_scattered(
             obj, request
         )
     )

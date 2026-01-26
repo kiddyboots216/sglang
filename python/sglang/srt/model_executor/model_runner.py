@@ -425,7 +425,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             enable=self.server_args.enable_memory_saver
         )
 
-        if self.server_args.remote_instance_weight_loader_use_transfer_engine() or self.server_args.enable_rdma_weight_updates:
+        if self.server_args.remote_instance_weight_loader_use_transfer_engine():
             self.remote_instance_init_transfer_engine()
 
         if not self.is_draft_worker:
@@ -467,7 +467,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.load_model()
 
         if (
-            (self.server_args.remote_instance_weight_loader_use_transfer_engine() or self.server_args.enable_rdma_weight_updates)
+            self.server_args.remote_instance_weight_loader_use_transfer_engine()
             and self.remote_instance_transfer_engine is not None
             and self.remote_instance_transfer_engine_weight_info is None
         ):
@@ -1362,154 +1362,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             logger.error(error_msg)
             return False, error_msg
 
-    def update_weights_from_distributed_inplace(
-        self,
-        names,
-        group_name,
-    ):
-        """
-        Update model weights in-place via NCCL broadcast.
-
-        Unlike update_weights_from_distributed which creates temporary buffers,
-        this method broadcasts directly into the model's parameter tensors.
-        This is zero-copy and requires no additional GPU memory.
-
-        Args:
-            names: List of parameter names to update (must match model parameter names)
-            group_name: NCCL group name
-
-        Returns:
-            Tuple of (success, message)
-        """
-        assert group_name in self._model_update_group, (
-            f"Group {group_name} not in {list(self._model_update_group.keys())}. "
-            "Please call `init_weights_update_group` first."
-        )
-
-        try:
-            # Build dict of model parameters
-            params_dict = dict(self.model.named_parameters())
-
-            handles = []
-            updated_names = []
-
-            for name in names:
-                if name not in params_dict:
-                    logger.warning(f"[NCCL_INPLACE] Parameter {name} not found in model, skipping")
-                    continue
-
-                param = params_dict[name]
-
-                # Broadcast directly into param.data (zero-copy!)
-                handle = torch.distributed.broadcast(
-                    param.data,
-                    src=0,
-                    group=self._model_update_group[group_name],
-                    async_op=True,
-                )
-                handles.append(handle)
-                updated_names.append(name)
-
-            # Wait for all broadcasts to complete
-            for handle in handles:
-                handle.wait()
-
-            logger.info(f"[NCCL_INPLACE] Updated {len(updated_names)} parameters in-place")
-            return True, f"Succeeded to update {len(updated_names)} parameters in-place."
-
-        except Exception as e:
-            error_msg = f"Failed to update parameters in-place: {e}"
-            logger.error(error_msg)
-            return False, error_msg
-
-    def update_weights_from_scattered(
-        self,
-        names,
-        group_name,
-    ):
-        """
-        Update model weights in-place via NCCL scatter for TP>1.
-
-        Unlike broadcast (which sends identical data to all ranks), scatter sends
-        different TP shards to each rank. This enables zero-copy in-place updates
-        for tensor-parallel models while preserving CUDA graphs.
-
-        The training side (rank 0) pre-shards weights and uses NCCL scatter to send
-        different shards to each inference rank directly into param.data.
-
-        Args:
-            names: List of parameter names to update (must match model parameter names)
-            group_name: NCCL group name
-
-        Returns:
-            Tuple of (success, message)
-        """
-        assert group_name in self._model_update_group, (
-            f"Group {group_name} not in {list(self._model_update_group.keys())}. "
-            "Please call `init_weights_update_group` first."
-        )
-
-        try:
-            # Build dict of model parameters
-            params_dict = dict(self.model.named_parameters())
-
-            updated_names = []
-
-            for idx, name in enumerate(names):
-                if name not in params_dict:
-                    logger.warning(f"[NCCL_SCATTER] Parameter {name} not found in model, skipping")
-                    continue
-
-                param = params_dict[name]
-
-                # DEBUG: Log param stats BEFORE scatter for first few and key weights
-                if idx < 5 or "qkv_proj" in name or "w13_weight" in name:
-                    p = param.data.float()
-                    logger.info(
-                        f"[NCCL_SCATTER_PRE] TP{self.tp_rank} {name}: shape={list(param.data.shape)}, "
-                        f"sum={p.sum().item():.4f}, mean={p.mean().item():.6f}"
-                    )
-
-                # NCCL scatter: each rank receives different data from src=0
-                # On receiver side (this code), scatter_list=None
-                # The recv tensor is param.data - receive directly into the parameter (zero-copy!)
-                torch.distributed.scatter(
-                    param.data,  # Receive buffer - this rank's shard goes here
-                    scatter_list=None,  # Receivers don't provide scatter_list
-                    src=0,  # Training (rank 0) is the sender
-                    group=self._model_update_group[group_name],
-                )
-
-                # DEBUG: Log param stats AFTER scatter for first few and key weights
-                if idx < 5 or "qkv_proj" in name or "w13_weight" in name:
-                    p = param.data.float()
-                    logger.info(
-                        f"[NCCL_SCATTER_POST] TP{self.tp_rank} {name}: shape={list(param.data.shape)}, "
-                        f"sum={p.sum().item():.4f}, mean={p.mean().item():.6f}"
-                    )
-                    if "qkv_proj" in name and "layers.0." in name:
-                        # Log Q, K, V separately for detailed analysis
-                        # Q=512, K=128, V=128 per TP rank for this model
-                        q_part = param.data[:512].float()
-                        k_part = param.data[512:640].float()
-                        v_part = param.data[640:].float()
-                        logger.info(
-                            f"[NCCL_SCATTER_QKV_DETAIL] TP{self.tp_rank} {name}: "
-                            f"Q_sum={q_part.sum().item():.4f}, "
-                            f"K_sum={k_part.sum().item():.4f}, "
-                            f"V_sum={v_part.sum().item():.4f}"
-                        )
-
-                updated_names.append(name)
-
-            logger.info(f"[NCCL_SCATTER] Updated {len(updated_names)} parameters in-place via scatter")
-            return True, f"Succeeded to update {len(updated_names)} parameters via scatter."
-
-        except Exception as e:
-            error_msg = f"Failed to update parameters via scatter: {e}"
-            logger.error(error_msg)
-            return False, error_msg
-
     def ep_scatter_receive(
         self,
         weight_names: List[str],
@@ -1636,14 +1488,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
                         updated_count += 1
 
-                logger.info(
-                    f"[EP_SCATTER] TP{self.tp_rank}: Using transfer plans - "
-                    f"{len(expert_transfer_plan or [])} expert weights, "
-                    f"{len(non_expert_transfer_plan or [])} non-expert weights"
-                )
             else:
                 # Legacy mode: detect expert weights by naming patterns
-                logger.info(f"[EP_SCATTER] TP{self.tp_rank}: Using legacy mode (no transfer plans)")
+                pass
 
                 for name in weight_names:
                     if name not in params_dict:
@@ -1764,12 +1611,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
             # ========== PHASE 1: Expert Weights ==========
             if expert_p2p_ops:
-                logger.info(f"[EP_SCATTER] TP{self.tp_rank}: PHASE 1 - Executing {len(expert_p2p_ops)} expert irecv ops")
                 reqs = batch_isend_irecv(expert_p2p_ops)
                 for req in reqs:
                     req.wait()
                 torch.cuda.synchronize()
-                logger.info(f"[EP_SCATTER] TP{self.tp_rank}: PHASE 1 complete - Expert weights received")
 
             # ========== PHASE 2: Non-Expert Weights (in sub-batches) ==========
             # Process non-expert weights in batches to match Tomni's batched sending.
@@ -1778,11 +1623,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 # Use transfer plan for batched processing
                 num_non_expert = len(non_expert_transfer_plan)
                 num_batches = (num_non_expert + non_expert_batch_size - 1) // non_expert_batch_size
-
-                logger.info(
-                    f"[EP_SCATTER] TP{self.tp_rank}: PHASE 2 - Processing {num_non_expert} non-expert weights "
-                    f"in {num_batches} batches of {non_expert_batch_size}"
-                )
 
                 for batch_idx in range(num_batches):
                     start_idx = batch_idx * non_expert_batch_size
@@ -1806,26 +1646,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         ))
 
                     if batch_ops:
-                        logger.info(
-                            f"[EP_SCATTER] TP{self.tp_rank}: PHASE 2 batch {batch_idx+1}/{num_batches}: "
-                            f"{len(batch_ops)} irecv ops"
-                        )
                         reqs = batch_isend_irecv(batch_ops)
                         for req in reqs:
                             req.wait()
                         torch.cuda.synchronize()
 
-                logger.info(f"[EP_SCATTER] TP{self.tp_rank}: PHASE 2 complete - Non-expert weights received")
-
             elif non_expert_p2p_ops:
                 # Legacy mode: process pre-built ops in a single batch
-                # Note: Legacy mode doesn't support batching since Tomni legacy also doesn't batch
-                logger.info(f"[EP_SCATTER] TP{self.tp_rank}: PHASE 2 (legacy) - Executing {len(non_expert_p2p_ops)} non-expert irecv ops")
                 reqs = batch_isend_irecv(non_expert_p2p_ops)
                 for req in reqs:
                     req.wait()
                 torch.cuda.synchronize()
-                logger.info(f"[EP_SCATTER] TP{self.tp_rank}: PHASE 2 (legacy) complete - Non-expert weights received")
 
             return True, f"Updated {updated_count} params in-place from {training_world_size} EP ranks (2-phase batched)"
 
@@ -2233,54 +2064,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     # NCCL broadcast recv (src=0 is training)
                     torch.distributed.broadcast(recv_buffer, src=0, group=group)
 
-                    # Log checksum of received weight for cross-verification with sender
-                    if bucket_idx == 0:
-                        from sglang.srt.distributed import get_tensor_model_parallel_rank
-                        tp_rank = get_tensor_model_parallel_rank()
-                        checksum = recv_buffer.sum().item()
-                        logger.info(f"[RECEIVER TP{tp_rank}] Received {name}: shape={recv_buffer.shape}, dtype={recv_buffer.dtype}, checksum={checksum:.6f}")
-
                     all_weights.append((name, recv_buffer))
-
-            logger.info(f"receive_weights: received {len(all_weights)} weights, applying to model")
 
             # Ensure use_presharded_weights=False for NCCL weight sync
             # NCCL sync sends FULL weights that need to be sharded per TP rank
             for module in self.model.modules():
                 if hasattr(module, 'use_presharded_weights'):
                     if module.use_presharded_weights:
-                        logger.warning(f"Resetting use_presharded_weights=False for {type(module).__name__}")
                         module.use_presharded_weights = False
 
             # Apply the received weights
             self.model.load_weights(all_weights)
-
-            # DEBUG: Checksum verification for weight sync debugging
-            from sglang.srt.distributed import get_tensor_model_parallel_rank
-            tp_rank = get_tensor_model_parallel_rank()
-            logger.info(f"[TP{tp_rank}] DEBUG: Verifying weight checksums after load_weights()")
-            param_count = 0
-            for name, param in self.model.named_parameters():
-                if param_count < 10:  # Log first 10 params
-                    checksum = param.data.sum().item()
-                    logger.info(f"[TP{tp_rank}] After load: {name} shape={param.shape} checksum={checksum:.6f}")
-                param_count += 1
-
-            # DEBUG: Verify tied weights (embedding <-> lm_head)
-            try:
-                if hasattr(self.model, 'model') and hasattr(self.model.model, 'embed_tokens'):
-                    embed_ptr = self.model.model.embed_tokens.weight.data_ptr()
-                    lm_head_ptr = self.model.lm_head.weight.data_ptr() if hasattr(self.model, 'lm_head') and hasattr(self.model.lm_head, 'weight') else None
-                    logger.info(f"[TP{tp_rank}] Tied weights: embed_ptr={embed_ptr}, lm_head_ptr={lm_head_ptr}, same={embed_ptr == lm_head_ptr}")
-
-                    # Also log checksums for embed and lm_head
-                    embed_checksum = self.model.model.embed_tokens.weight.data.sum().item()
-                    logger.info(f"[TP{tp_rank}] embed_tokens.weight checksum={embed_checksum:.6f}")
-                    if hasattr(self.model, 'lm_head') and hasattr(self.model.lm_head, 'weight'):
-                        lm_head_checksum = self.model.lm_head.weight.data.sum().item()
-                        logger.info(f"[TP{tp_rank}] lm_head.weight checksum={lm_head_checksum:.6f}")
-            except Exception as e:
-                logger.warning(f"[TP{tp_rank}] Could not verify tied weights: {e}")
 
             # Re-establish tied embeddings if necessary (defensive fix)
             has_tied_embeddings = getattr(self.model_config.hf_config, 'tie_word_embeddings', False)
@@ -2292,22 +2086,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                             if embed_weight.data_ptr() != self.model.lm_head.weight.data_ptr():
                                 logger.warning("receive_weights: tied embeddings aliasing broken, re-establishing...")
                                 self.model.lm_head.weight = embed_weight
-                                logger.info("receive_weights: tied embeddings re-established")
                 except Exception as e:
                     logger.warning(f"receive_weights: could not verify/fix tied embeddings: {e}")
 
             # CRITICAL: Synchronize CUDA to ensure all weight updates are complete
             torch.cuda.synchronize()
-            logger.info("receive_weights: CUDA synchronized after weight update")
 
             # CRITICAL: Recapture CUDA graphs after weight update
             # CUDA graphs capture memory pointers at capture time - must recapture when weights change
             if recapture_cuda_graph and self.device == "cuda" and not self.server_args.disable_cuda_graph:
-                logger.info("receive_weights: recapturing CUDA graphs after weight update")
                 self.init_device_graphs()
-                logger.info("receive_weights: CUDA graph recapture complete")
 
-            logger.info("receive_weights: weights applied successfully")
             return True, f"Received and applied {len(all_weights)} weights"
 
         except Exception as e:
@@ -2395,91 +2184,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             logger.error(f"Error when getting parameter {name}: {e}")
             return None
 
-    # ========================================================================
-    # RDMA Direct Weight Update Methods
-    # ========================================================================
-
-    def get_rdma_weight_addresses(self, weight_names=None):
-        """Get RDMA-accessible weight addresses for direct GPU writes.
-
-        Returns weight memory addresses that can be used for RDMA PUSH model updates.
-        The TransferEngine must be initialized (via --enable-rdma-weight-updates flag).
-
-        Args:
-            weight_names: Optional list of specific weight names to get addresses for.
-                         If None, returns addresses for all weights.
-
-        Returns:
-            Dict with success, message, rdma_session_id, rdma_addr, and weights info.
-        """
-        # Check if RDMA weight updates are enabled
-        if not self.server_args.enable_rdma_weight_updates:
-            return {
-                "success": False,
-                "message": "RDMA weight updates not enabled. Start server with --enable-rdma-weight-updates",
-                "rdma_session_id": "",
-                "rdma_addr": "",
-                "weights": {},
-            }
-
-        # Check if TransferEngine is initialized
-        if self.remote_instance_transfer_engine is None:
-            return {
-                "success": False,
-                "message": "TransferEngine not initialized. Check mooncake installation.",
-                "rdma_session_id": "",
-                "rdma_addr": "",
-                "weights": {},
-            }
-
-        # Get weight info from registered memory regions
-        if self.remote_instance_transfer_engine_weight_info is None:
-            return {
-                "success": False,
-                "message": "Weight memory not registered for RDMA. Model may not be loaded.",
-                "rdma_session_id": "",
-                "rdma_addr": "",
-                "weights": {},
-            }
-
-        try:
-            # Build weights dict with memory addresses
-            weights_dict = {}
-            for name, info in self.remote_instance_transfer_engine_weight_info.items():
-                if weight_names is None or name in weight_names:
-                    # info can be (data_ptr, numel, element_size) or (data_ptr, numel, element_size, shape, dtype)
-                    if len(info) >= 5:
-                        data_ptr, numel, element_size, shape, dtype_str = info[:5]
-                    else:
-                        data_ptr, numel, element_size = info[:3]
-                        dtype_str = "bfloat16"  # Default
-                        shape = []
-
-                    weights_dict[name] = {
-                        "data_ptr": data_ptr,
-                        "numel": numel,
-                        "element_size": element_size,
-                        "dtype": dtype_str,
-                        "shape": shape,
-                    }
-
-            return {
-                "success": True,
-                "message": f"Found {len(weights_dict)} weights",
-                "rdma_session_id": self.remote_instance_transfer_engine_session_id,
-                "rdma_addr": self.remote_instance_transfer_engine_session_id,  # Same format
-                "weights": weights_dict,
-            }
-        except Exception as e:
-            logger.error(f"get_rdma_weight_addresses failed: {e}")
-            return {
-                "success": False,
-                "message": str(e),
-                "rdma_session_id": "",
-                "rdma_addr": "",
-                "weights": {},
-            }
-
     def get_remote_instance_transfer_engine_info(self):
         """Get transfer engine info for remote instance weight loading."""
         if self.remote_instance_transfer_engine_weight_info is None:
@@ -2488,134 +2192,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.remote_instance_transfer_engine_session_id,
             self.remote_instance_transfer_engine_weight_info,
         )
-
-    def prepare_rdma_weight_update(self, weight_version=""):
-        """Prepare for RDMA weight update.
-
-        This synchronizes CUDA to ensure no operations are in flight that might
-        access weights during the RDMA write.
-
-        Args:
-            weight_version: Optional version identifier for logging.
-
-        Returns:
-            Tuple[bool, str]: (success, message)
-        """
-        try:
-            logger.info(f"prepare_rdma_weight_update: version={weight_version}")
-
-            # Synchronize CUDA to ensure all pending operations complete
-            torch.cuda.synchronize()
-
-            logger.info("prepare_rdma_weight_update: CUDA synchronized, ready for RDMA writes")
-            return True, "Ready for RDMA weight writes"
-
-        except Exception as e:
-            error_msg = f"prepare_rdma_weight_update failed: {e}"
-            logger.error(error_msg)
-            return False, error_msg
-
-    def complete_rdma_weight_update(self, flush_cache=True, weight_version=""):
-        """Complete RDMA weight update.
-
-        Called after RDMA writes are done to synchronize and ensure weights
-        are visible to subsequent CUDA operations.
-
-        Args:
-            flush_cache: Whether to flush KV cache after weight update.
-            weight_version: Optional version identifier for logging.
-
-        Returns:
-            Tuple[bool, str]: (success, message)
-        """
-        try:
-            logger.info(f"complete_rdma_weight_update: version={weight_version}, flush_cache={flush_cache}")
-
-            # Synchronize CUDA to ensure RDMA writes are visible
-            torch.cuda.synchronize()
-
-            # Re-establish tied embeddings if necessary
-            has_tied_embeddings = getattr(self.model_config.hf_config, 'tie_word_embeddings', False)
-            if has_tied_embeddings:
-                try:
-                    if hasattr(self.model, 'model') and hasattr(self.model.model, 'embed_tokens'):
-                        embed_weight = self.model.model.embed_tokens.weight
-                        if hasattr(self.model, 'lm_head') and hasattr(self.model.lm_head, 'weight'):
-                            if embed_weight.data_ptr() != self.model.lm_head.weight.data_ptr():
-                                logger.warning("complete_rdma_weight_update: tied embeddings aliasing broken, re-establishing...")
-                                self.model.lm_head.weight = embed_weight
-                                logger.info("complete_rdma_weight_update: tied embeddings re-established")
-                except Exception as e:
-                    logger.warning(f"complete_rdma_weight_update: could not verify/fix tied embeddings: {e}")
-
-            logger.info("complete_rdma_weight_update: RDMA weight update completed successfully")
-            return True, "RDMA weight update completed"
-
-        except Exception as e:
-            error_msg = f"complete_rdma_weight_update failed: {e}"
-            logger.error(error_msg)
-            return False, error_msg
-
-    def debug_weight(self, name: str):
-        """Get detailed debug info about a specific weight tensor.
-
-        Used to verify RDMA weight sync by comparing tensor values before/after transfer.
-
-        Args:
-            name: Parameter name (e.g., "model.layers.0.input_layernorm.weight")
-
-        Returns:
-            Dict with success, name, shape, dtype, data_ptr, checksum, first/last values.
-        """
-        try:
-            # Find the parameter by name
-            for param_name, param in self.model.named_parameters():
-                if param_name == name or param_name.replace(".", "_") == name.replace(".", "_"):
-                    # Compute debug info
-                    with torch.no_grad():
-                        data = param.data
-                        flat = data.flatten().float()
-                        checksum = flat.sum().item()
-                        first_values = flat[:10].tolist() if flat.numel() >= 10 else flat.tolist()
-                        last_values = flat[-10:].tolist() if flat.numel() >= 10 else []
-
-                    return {
-                        "success": True,
-                        "message": f"Found weight {param_name}",
-                        "name": param_name,
-                        "shape": list(data.shape),
-                        "dtype": str(data.dtype).replace("torch.", ""),
-                        "data_ptr": data.data_ptr(),
-                        "checksum": checksum,
-                        "first_values": first_values,
-                        "last_values": last_values,
-                    }
-
-            return {
-                "success": False,
-                "message": f"Weight {name} not found",
-                "name": name,
-                "shape": [],
-                "dtype": "",
-                "data_ptr": 0,
-                "checksum": 0.0,
-                "first_values": [],
-                "last_values": [],
-            }
-
-        except Exception as e:
-            logger.error(f"debug_weight failed: {e}")
-            return {
-                "success": False,
-                "message": str(e),
-                "name": name,
-                "shape": [],
-                "dtype": "",
-                "data_ptr": 0,
-                "checksum": 0.0,
-                "first_values": [],
-                "last_values": [],
-            }
 
     def list_weights(self, prefix: str = None):
         """List all weight names in the model.

@@ -642,9 +642,6 @@ class ServerArgs:
     remote_instance_weight_loader_backend: Literal["transfer_engine", "nccl"] = "nccl"
     remote_instance_weight_loader_start_seed_via_transfer_engine: bool = False
 
-    # For RDMA direct weight updates (training pushes to inference)
-    enable_rdma_weight_updates: bool = False
-
     # For PD-Multiplexing
     enable_pdmux: bool = False
     pdmux_config_path: Optional[str] = None

@@ -415,15 +415,6 @@ class VocabParallelEmbedding(torch.nn.Module):
         output_dim = getattr(param, "output_dim", None)
         packed_dim = getattr(param, "packed_dim", None)
 
-        # DEBUG: Log TP sharding info for weight sync debugging
-        tp_rank = get_tensor_model_parallel_rank()
-        start_idx_debug = self.shard_indices.org_vocab_start_index
-        shard_size_debug = self.shard_indices.org_vocab_end_index - start_idx_debug
-        logger.info(f"[TP{tp_rank}] VocabEmbed.weight_loader: loaded={loaded_weight.shape}, "
-                    f"start_idx={start_idx_debug}, shard_size={shard_size_debug}, "
-                    f"tp_size={self.tp_size}, output_dim={output_dim}, "
-                    f"use_presharded_weights={self.use_presharded_weights}")
-
         # If the parameter is a gguf weight, then load it directly.
         if getattr(param, "is_gguf_weight_type", None):
             param.data.copy_(loaded_weight)

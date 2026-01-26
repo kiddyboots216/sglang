@@ -22,28 +22,22 @@ import torch
 
 from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.managers.io_struct import (
-    CompleteRDMAWeightUpdateReqInput,
     CompleteWeightsUpdateReqInput,
-    DebugWeightReqInput,
     DestroyWeightsUpdateGroupReqInput,
-    GetRDMAWeightAddressesReqInput,
     GetWeightsByNameReqInput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsUpdateGroupReqInput,
     ListWeightsReqInput,
     LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterReqInput,
-    PrepareRDMAWeightUpdateReqInput,
     PrepareWeightsUpdateReqInput,
     ReceiveWeightsEPScatterReqInput,
     ReceiveWeightsReqInput,
     SendWeightsToRemoteInstanceReqInput,
     UnloadLoRAAdapterReqInput,
     UpdateWeightFromDiskReqInput,
-    UpdateWeightsFromDistributedInplaceReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
-    UpdateWeightsFromScatteredReqInput,
     UpdateWeightsFromTensorReqInput,
 )
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
@@ -162,26 +156,6 @@ class BaseTpWorker(ABC):
         )
         return success, message
 
-    def update_weights_from_distributed_inplace(
-        self, recv_req: UpdateWeightsFromDistributedInplaceReqInput
-    ):
-        """Update weights in-place via NCCL broadcast (zero-copy)."""
-        success, message = self.model_runner.update_weights_from_distributed_inplace(
-            recv_req.names,
-            recv_req.group_name,
-        )
-        return success, message
-
-    def update_weights_from_scattered(
-        self, recv_req: UpdateWeightsFromScatteredReqInput
-    ):
-        """Update weights in-place via NCCL scatter for TP>1."""
-        success, message = self.model_runner.update_weights_from_scattered(
-            recv_req.names,
-            recv_req.group_name,
-        )
-        return success, message
-
     def prepare_weights_update(self, recv_req: PrepareWeightsUpdateReqInput):
         """Phase 1 of two-phase weight update protocol.
 
@@ -205,35 +179,6 @@ class BaseTpWorker(ABC):
             recv_req.group_name,
         )
         return success, message
-
-    # ========================================================================
-    # RDMA Direct Weight Update Methods
-    # ========================================================================
-
-    def get_rdma_weight_addresses(self, recv_req: GetRDMAWeightAddressesReqInput):
-        """Get RDMA-accessible weight addresses for direct GPU writes."""
-        return self.model_runner.get_rdma_weight_addresses(
-            weight_names=recv_req.weight_names,
-        )
-
-    def prepare_rdma_weight_update(self, recv_req: PrepareRDMAWeightUpdateReqInput):
-        """Prepare for RDMA weight update."""
-        success, message = self.model_runner.prepare_rdma_weight_update(
-            weight_version=recv_req.weight_version,
-        )
-        return success, message
-
-    def complete_rdma_weight_update(self, recv_req: CompleteRDMAWeightUpdateReqInput):
-        """Complete RDMA weight update."""
-        success, message = self.model_runner.complete_rdma_weight_update(
-            flush_cache=recv_req.flush_cache,
-            weight_version=recv_req.weight_version,
-        )
-        return success, message
-
-    def debug_weight(self, recv_req):
-        """Get debug info about a specific weight for RDMA debugging."""
-        return self.model_runner.debug_weight(name=recv_req.name)
 
     def list_weights(self, recv_req):
         """List all weight names in the model."""

@@ -76,7 +76,6 @@ from sglang.srt.managers.io_struct import (
     ClearHiCacheReqInput,
     ClearHiCacheReqOutput,
     CloseSessionReqInput,
-    CompleteRDMAWeightUpdateReqInput,
     ContinueGenerationReqInput,
     DestroyWeightsUpdateGroupReqInput,
     ExpertDistributionReq,
@@ -89,9 +88,7 @@ from sglang.srt.managers.io_struct import (
     GetInternalStateReqOutput,
     GetLoadReqInput,
     GetLoadsReqInput,
-    GetRDMAWeightAddressesReqInput,
     GetWeightsByNameReqInput,
-    DebugWeightReqInput,
     ListWeightsReqInput,
     HealthCheckOutput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
@@ -104,7 +101,6 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqInput,
     OpenSessionReqOutput,
     PauseGenerationReqInput,
-    PrepareRDMAWeightUpdateReqInput,
     PrepareWeightsUpdateReqInput,
     ProfileReq,
     ReceiveWeightsEPScatterReqInput,
@@ -124,10 +120,8 @@ from sglang.srt.managers.io_struct import (
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
     UpdateWeightFromDiskReqInput,
-    UpdateWeightsFromDistributedInplaceReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
-    UpdateWeightsFromScatteredReqInput,
     UpdateWeightsFromTensorReqInput,
     CompleteWeightsUpdateReqInput,
 )
@@ -1041,20 +1035,8 @@ class Scheduler(
                     UpdateWeightsFromDistributedReqInput,
                     self.update_weights_from_distributed,
                 ),
-                (
-                    UpdateWeightsFromDistributedInplaceReqInput,
-                    self.update_weights_from_distributed_inplace,
-                ),
-                (
-                    UpdateWeightsFromScatteredReqInput,
-                    self.update_weights_from_scattered,
-                ),
                 (PrepareWeightsUpdateReqInput, self.prepare_weights_update),
                 (CompleteWeightsUpdateReqInput, self.complete_weights_update),
-                (GetRDMAWeightAddressesReqInput, self.get_rdma_weight_addresses),
-                (PrepareRDMAWeightUpdateReqInput, self.prepare_rdma_weight_update),
-                (CompleteRDMAWeightUpdateReqInput, self.complete_rdma_weight_update),
-                (DebugWeightReqInput, self.debug_weight),
                 (ListWeightsReqInput, self.list_weights),
                 (ReceiveWeightsReqInput, self.receive_weights),
                 (ReceiveWeightsEPScatterReqInput, self.receive_weights_ep_scatter),
@@ -2932,8 +2914,8 @@ def run_scheduler_process(
             "max_total_num_tokens": scheduler.max_total_num_tokens,
             "max_req_input_len": scheduler.max_req_input_len,
         }
-        # Collect transfer engine info at startup for remote instance loading OR RDMA weight updates
-        if server_args.remote_instance_weight_loader_use_transfer_engine() or server_args.enable_rdma_weight_updates:
+        # Collect transfer engine info at startup for remote instance loading
+        if server_args.remote_instance_weight_loader_use_transfer_engine():
             (
                 remote_instance_transfer_engine_session_id,
                 remote_instance_transfer_engine_weights_info_dict,

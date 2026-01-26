@@ -28,12 +28,8 @@ from sglang.srt.managers.io_struct import (
     ClearHiCacheReqInput,
     ClearHiCacheReqOutput,
     CloseSessionReqInput,
-    CompleteRDMAWeightUpdateReqInput,
-    CompleteRDMAWeightUpdateReqOutput,
     CompleteWeightsUpdateReqInput,
     CompleteWeightsUpdateReqOutput,
-    DebugWeightReqInput,
-    DebugWeightReqOutput,
     DestroyWeightsUpdateGroupReqInput,
     DestroyWeightsUpdateGroupReqOutput,
     ExpertDistributionReq,
@@ -47,8 +43,6 @@ from sglang.srt.managers.io_struct import (
     GetLoadReqOutput,
     GetLoadsReqInput,
     GetLoadsReqOutput,
-    GetRDMAWeightAddressesReqInput,
-    GetRDMAWeightAddressesReqOutput,
     GetWeightsByNameReqInput,
     GetWeightsByNameReqOutput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
@@ -63,8 +57,6 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqOutput,
     LoRAUpdateOutput,
     OpenSessionReqInput,
-    PrepareRDMAWeightUpdateReqInput,
-    PrepareRDMAWeightUpdateReqOutput,
     PrepareWeightsUpdateReqInput,
     PrepareWeightsUpdateReqOutput,
     ProfileReq,
@@ -86,11 +78,8 @@ from sglang.srt.managers.io_struct import (
     SlowDownReqOutput,
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
-    UpdateWeightsFromDistributedInplaceReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromDistributedReqOutput,
-    UpdateWeightsFromScatteredReqInput,
-    UpdateWeightsFromScatteredReqOutput,
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromIPCReqOutput,
     UpdateWeightsFromTensorReqInput,
@@ -190,12 +179,6 @@ class TokenizerCommunicatorMixin:
         self.update_weights_from_distributed_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
-        self.update_weights_from_distributed_inplace_communicator = _Communicator(
-            self.send_to_scheduler, server_args.dp_size
-        )
-        self.update_weights_from_scattered_communicator = _Communicator(
-            self.send_to_scheduler, server_args.dp_size
-        )
         self.prepare_weights_update_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
@@ -230,21 +213,6 @@ class TokenizerCommunicatorMixin:
             self.send_to_scheduler, server_args.dp_size
         )
         self.check_weights_communicator = _Communicator(
-            self.send_to_scheduler, server_args.dp_size
-        )
-        # RDMA direct weight update communicators
-        # Note: RDMA addresses are per-TP-rank, but the PUSH socket only delivers
-        # to one scheduler. The scheduler aggregates addresses from all TP ranks at startup.
-        self.get_rdma_weight_addresses_communicator = _Communicator(
-            self.send_to_scheduler, server_args.dp_size
-        )
-        self.prepare_rdma_weight_update_communicator = _Communicator(
-            self.send_to_scheduler, server_args.dp_size
-        )
-        self.complete_rdma_weight_update_communicator = _Communicator(
-            self.send_to_scheduler, server_args.dp_size
-        )
-        self.debug_weight_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
         self.list_weights_communicator = _Communicator(
@@ -299,10 +267,6 @@ class TokenizerCommunicatorMixin:
                     self.update_weights_from_distributed_communicator.handle_recv,
                 ),
                 (
-                    UpdateWeightsFromScatteredReqOutput,
-                    self.update_weights_from_scattered_communicator.handle_recv,
-                ),
-                (
                     PrepareWeightsUpdateReqOutput,
                     self.prepare_weights_update_communicator.handle_recv,
                 ),
@@ -349,22 +313,6 @@ class TokenizerCommunicatorMixin:
                 (
                     CheckWeightsReqOutput,
                     self.check_weights_communicator.handle_recv,
-                ),
-                (
-                    GetRDMAWeightAddressesReqOutput,
-                    self.get_rdma_weight_addresses_communicator.handle_recv,
-                ),
-                (
-                    PrepareRDMAWeightUpdateReqOutput,
-                    self.prepare_rdma_weight_update_communicator.handle_recv,
-                ),
-                (
-                    CompleteRDMAWeightUpdateReqOutput,
-                    self.complete_rdma_weight_update_communicator.handle_recv,
-                ),
-                (
-                    DebugWeightReqOutput,
-                    self.debug_weight_communicator.handle_recv,
                 ),
                 (
                     ListWeightsReqOutput,
@@ -549,79 +497,6 @@ class TokenizerCommunicatorMixin:
         finally:
             self._weight_update_in_progress = False
 
-    async def update_weights_from_distributed_inplace(
-        self: TokenizerManager,
-        obj: UpdateWeightsFromDistributedInplaceReqInput,
-        request: Optional[fastapi.Request] = None,
-    ) -> Tuple[bool, str]:
-        """Update model weights in-place via NCCL broadcast (zero-copy)."""
-        self.auto_create_handle_loop()
-        assert (
-            self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
-        ), "dp_size must be 1 or dp attention must be enabled"
-
-        # Immediately update the weights if the engine is in paused state
-        async with self.is_pause_cond:
-            is_paused = self.is_pause
-
-        lock_context = (
-            self.model_update_lock.writer_lock if not is_paused else nullcontext()
-        )
-        self._weight_update_in_progress = True
-        try:
-            async with lock_context:
-                results = await self.update_weights_from_distributed_inplace_communicator(
-                    obj
-                )
-
-            success, message = _Communicator.merge_results(results)
-            if success and obj.weight_version is not None:
-                self._update_weight_version_if_provided(obj.weight_version)
-                message += f" Weight version updated to {obj.weight_version}."
-
-            return success, message
-        finally:
-            self._weight_update_in_progress = False
-
-    async def update_weights_from_scattered(
-        self: TokenizerManager,
-        obj: UpdateWeightsFromScatteredReqInput,
-        request: Optional[fastapi.Request] = None,
-    ) -> Tuple[bool, str]:
-        """Update model weights in-place via NCCL scatter for TP>1.
-
-        Unlike broadcast (which sends identical data to all ranks), scatter sends
-        different TP shards to each rank. This enables zero-copy in-place updates
-        for tensor-parallel models while preserving CUDA graphs.
-        """
-        self.auto_create_handle_loop()
-        assert (
-            self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
-        ), "dp_size must be 1 or dp attention must be enabled"
-
-        # Immediately update the weights if the engine is in paused state
-        async with self.is_pause_cond:
-            is_paused = self.is_pause
-
-        lock_context = (
-            self.model_update_lock.writer_lock if not is_paused else nullcontext()
-        )
-        self._weight_update_in_progress = True
-        try:
-            async with lock_context:
-                results = await self.update_weights_from_scattered_communicator(
-                    obj
-                )
-
-            success, message = _Communicator.merge_results(results)
-            if success and obj.weight_version is not None:
-                self._update_weight_version_if_provided(obj.weight_version)
-                message += f" Weight version updated to {obj.weight_version}."
-
-            return success, message
-        finally:
-            self._weight_update_in_progress = False
-
     async def prepare_weights_update(
         self: TokenizerManager,
         obj: PrepareWeightsUpdateReqInput,
@@ -681,195 +556,6 @@ class TokenizerCommunicatorMixin:
         finally:
             # Reset the flag after the complete phase
             self._weight_update_in_progress = False
-
-    # ========================================================================
-    # RDMA Direct Weight Update Methods
-    # ========================================================================
-
-    async def get_rdma_weight_addresses(
-        self: TokenizerManager,
-        obj: GetRDMAWeightAddressesReqInput,
-        rank: int = 0,
-    ) -> Dict[str, Any]:
-        """Get RDMA-accessible weight addresses for direct GPU writes.
-
-        Returns weight memory addresses that can be used for RDMA PUSH model updates.
-        Each TP rank has different GPU addresses for its weight shard, so we need to
-        filter results by the requested tp_rank.
-
-        Args:
-            obj: Request input (optional weight_names filter)
-            rank: The TP rank to get addresses for (0 to tp_size-1)
-
-        Returns:
-            Dict with success, message, rdma_session_id, rdma_addr, and weights for the requested rank.
-        """
-        self.auto_create_handle_loop()
-
-        # Send to all schedulers (tp_size * dp_size) and collect responses
-        results = await self.get_rdma_weight_addresses_communicator(obj)
-
-        if not results or len(results) == 0:
-            return {
-                "success": False,
-                "message": "No response from scheduler",
-                "rdma_session_id": "",
-                "rdma_addr": "",
-                "weights": {},
-            }
-
-        # Filter results by the requested tp_rank
-        for result in results:
-            if hasattr(result, "success") and result.success:
-                if hasattr(result, "tp_rank") and result.tp_rank == rank:
-                    return {
-                        "success": result.success,
-                        "message": result.message,
-                        "rdma_session_id": result.rdma_session_id,
-                        "rdma_addr": result.rdma_addr,
-                        "weights": result.weights,
-                    }
-
-        # If no exact rank match found, check if any result succeeded
-        # This handles backward compatibility where tp_rank might not be set
-        for result in results:
-            if hasattr(result, "success") and result.success:
-                # Log warning that we're returning potentially wrong rank
-                import logging
-                logging.warning(
-                    f"get_rdma_weight_addresses: Requested rank {rank} not found in responses, "
-                    f"returning first successful result (tp_rank={getattr(result, 'tp_rank', 'unknown')})"
-                )
-                return {
-                    "success": result.success,
-                    "message": result.message,
-                    "rdma_session_id": result.rdma_session_id,
-                    "rdma_addr": result.rdma_addr,
-                    "weights": result.weights,
-                }
-
-        # All results failed, return the first error
-        result = results[0]
-        return {
-            "success": result.success,
-            "message": result.message,
-            "rdma_session_id": "",
-            "rdma_addr": "",
-            "weights": {},
-        }
-
-    async def prepare_rdma_weight_update(
-        self: TokenizerManager,
-        obj: PrepareRDMAWeightUpdateReqInput,
-        request: Optional[fastapi.Request] = None,
-    ) -> Tuple[bool, str]:
-        """Prepare for RDMA weight update.
-
-        This pauses inference and synchronizes CUDA to ensure weights are not being accessed.
-        """
-        self.auto_create_handle_loop()
-
-        # Set the flag to indicate weight update is in progress
-        self._weight_update_in_progress = True
-
-        try:
-            results = await self.prepare_rdma_weight_update_communicator(obj)
-            success, message = _Communicator.merge_results(results)
-
-            if not success:
-                self._weight_update_in_progress = False
-
-            return success, message
-        except Exception as e:
-            self._weight_update_in_progress = False
-            raise e
-
-    async def complete_rdma_weight_update(
-        self: TokenizerManager,
-        obj: CompleteRDMAWeightUpdateReqInput,
-        request: Optional[fastapi.Request] = None,
-    ) -> Tuple[bool, str]:
-        """Complete RDMA weight update.
-
-        Called after RDMA writes are done to synchronize and resume inference.
-        """
-        self.auto_create_handle_loop()
-
-        try:
-            results = await self.complete_rdma_weight_update_communicator(obj)
-            success, message = _Communicator.merge_results(results)
-
-            if success and obj.weight_version:
-                self._update_weight_version_if_provided(obj.weight_version)
-                message += f" Weight version updated to {obj.weight_version}."
-
-            return success, message
-        finally:
-            self._weight_update_in_progress = False
-
-    async def debug_weight(
-        self: TokenizerManager,
-        obj: DebugWeightReqInput,
-        rank: int = 0,
-    ) -> Dict[str, Any]:
-        """Get detailed debug info about a specific weight tensor.
-
-        Used to verify RDMA weight sync by comparing tensor values before/after transfer.
-
-        Args:
-            obj: Request input with weight name
-            rank: The TP rank to get info from (0 to tp_size-1)
-
-        Returns:
-            Dict with success, name, shape, dtype, data_ptr, checksum, first/last values.
-        """
-        self.auto_create_handle_loop()
-
-        results = await self.debug_weight_communicator(obj)
-
-        if not results or len(results) == 0:
-            return {
-                "success": False,
-                "message": "No response from scheduler",
-            }
-
-        # Filter results by the requested tp_rank
-        for result in results:
-            if hasattr(result, "success") and result.success:
-                if hasattr(result, "tp_rank") and result.tp_rank == rank:
-                    return {
-                        "success": result.success,
-                        "message": result.message,
-                        "name": result.name,
-                        "shape": result.shape,
-                        "dtype": result.dtype,
-                        "data_ptr": result.data_ptr,
-                        "checksum": result.checksum,
-                        "first_values": result.first_values,
-                        "last_values": result.last_values,
-                    }
-
-        # If no exact rank match, return first successful result
-        for result in results:
-            if hasattr(result, "success") and result.success:
-                return {
-                    "success": result.success,
-                    "message": result.message,
-                    "name": result.name,
-                    "shape": result.shape,
-                    "dtype": result.dtype,
-                    "data_ptr": result.data_ptr,
-                    "checksum": result.checksum,
-                    "first_values": result.first_values,
-                    "last_values": result.last_values,
-                }
-
-        # All results failed
-        result = results[0]
-        return {
-            "success": result.success,
-            "message": result.message,
-        }
 
     async def list_weights(
         self: TokenizerManager,
