@@ -1400,6 +1400,10 @@ class ReceiveWeightsEPScatterReqInput(BaseReq):
     flush_cache: bool = True
     free_kv_cache_before_recv: bool = False
     recapture_cuda_graph: bool = False
+    # Skip flush_cache and use lightweight synchronize() instead.
+    # This is safe for in-place weight updates where tensor addresses are preserved.
+    # Avoids expensive torch.cuda.empty_cache() (~30s overhead).
+    skip_flush_cache: bool = False
     # NCCL group initialization params (passed from training rank 0)
     master_address: Optional[str] = None  # Training master IP for rendezvous
     master_port: Optional[int] = None  # TCP port for rendezvous

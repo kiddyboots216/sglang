@@ -350,10 +350,20 @@ class SchedulerUpdateWeightsMixin:
             # Now do the actual P2P receives
             success, message = self.tp_worker.receive_weights_ep_scatter(recv_req)
 
-            if success and recv_req.flush_cache:
-                flush_success = self.flush_cache()
-                if not flush_success:
-                    message += " (warning: cache flush failed)"
+            if success:
+                if recv_req.skip_flush_cache:
+                    # Use lightweight synchronization instead of full flush_cache.
+                    # This is safe for in-place weight updates where:
+                    # - Weights are written directly to param.data
+                    # - CUDA graphs and tensor memory addresses are preserved
+                    # - KV cache layout doesn't change
+                    # Avoids expensive torch.cuda.empty_cache() (~30s overhead).
+                    torch.cuda.synchronize()
+                    logger.info("Weight transfer complete, using lightweight synchronize (skip_flush_cache=True)")
+                elif recv_req.flush_cache:
+                    flush_success = self.flush_cache()
+                    if not flush_success:
+                        message += " (warning: cache flush failed)"
 
             return ReceiveWeightsEPScatterReqOutput(success=success, message=message)
         except Exception as e:
