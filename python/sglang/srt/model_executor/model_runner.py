@@ -1402,6 +1402,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         """
         from torch.distributed import P2POp, batch_isend_irecv
 
+        logger.info(
+            f"[TP{self.tp_rank}] ep_scatter_receive called: {len(weight_names)} weight_names, "
+            f"training_world_size={training_world_size}, num_experts_per_rank={num_experts_per_rank}, "
+            f"total_num_experts={total_num_experts}"
+        )
+        logger.info(
+            f"[TP{self.tp_rank}] Transfer plans: expert_transfer_plan={len(expert_transfer_plan or [])} entries, "
+            f"non_expert_transfer_plan={len(non_expert_transfer_plan or [])} entries"
+        )
+
         try:
             torch.cuda.set_device(self.gpu_id)
 
@@ -1609,12 +1619,92 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
                     updated_count += 1
 
-            # ========== PHASE 1: Expert Weights ==========
-            if expert_p2p_ops:
-                reqs = batch_isend_irecv(expert_p2p_ops)
-                for req in reqs:
-                    req.wait()
+            # ========== PHASE 1: Expert Weights (batched by layer) ==========
+            # CRITICAL: Tomni sends expert weights layer-by-layer (one batch_isend_irecv per layer).
+            # SGLang MUST receive in the same batches to match NCCL P2P operations.
+            # PyTorch's batch_isend_irecv returns a coalesced Work object in NCCL backend,
+            # so if we batch differently, the recv side completes prematurely while Tomni
+            # is still sending subsequent batches, causing a deadlock.
+            if expert_transfer_plan:
+                # Group transfers by layer to match Tomni's batched sending
+                layer_transfers = {}
+                for transfer in expert_transfer_plan:
+                    name = transfer["weight_name"]
+                    if name not in params_dict:
+                        continue
+                    # Extract layer index from name like "model.layers.0.mlp.experts.w13_weight"
+                    if ".layers." in name:
+                        parts = name.split(".")
+                        for i, part in enumerate(parts):
+                            if part == "layers" and i + 1 < len(parts):
+                                try:
+                                    layer_idx = int(parts[i + 1])
+                                    if layer_idx not in layer_transfers:
+                                        layer_transfers[layer_idx] = []
+                                    layer_transfers[layer_idx].append(transfer)
+                                except ValueError:
+                                    pass  # Not a numeric layer index
+                                break
+
+                num_layers = len(layer_transfers)
+                logger.info(f"[TP{self.tp_rank}] PHASE 1: Processing {num_layers} expert layers (batched by layer)")
+
+                for layer_idx in sorted(layer_transfers.keys()):
+                    layer_batch = layer_transfers[layer_idx]
+                    layer_ops = []
+
+                    for transfer in layer_batch:
+                        name = transfer["weight_name"]
+                        param = params_dict[name]
+                        expert_ranges = transfer["expert_ranges"]
+
+                        for ep_rank_str, range_info in expert_ranges.items():
+                            start = range_info["start"]
+                            end = range_info["end"]
+                            source_rank = range_info["source_nccl_rank"]
+
+                            recv_buffer = param.data[start:end]
+                            layer_ops.append(P2POp(
+                                op=torch.distributed.irecv,
+                                tensor=recv_buffer,
+                                peer=source_rank,
+                                group=group,
+                            ))
+
+                    if layer_ops:
+                        logger.info(f"[TP{self.tp_rank}] PHASE 1: Layer {layer_idx}, {len(layer_ops)} recv ops")
+                        reqs = batch_isend_irecv(layer_ops)
+                        for req in reqs:
+                            req.wait()
+
+                logger.info(f"[TP{self.tp_rank}] PHASE 1: All {num_layers} expert layers received")
                 torch.cuda.synchronize()
+                logger.info(f"[TP{self.tp_rank}] PHASE 1: Expert weights synchronized")
+
+            elif expert_p2p_ops:
+                # Legacy mode: no transfer plan, use pre-built ops in a single batch
+                logger.info(f"[TP{self.tp_rank}] PHASE 1 (legacy): Built {len(expert_p2p_ops)} expert recv ops")
+                # Log first few ops for debugging
+                for i, op in enumerate(expert_p2p_ops[:5]):
+                    logger.info(
+                        f"[TP{self.tp_rank}]   expert_op[{i}]: recv from rank {op.peer}, "
+                        f"tensor shape {list(op.tensor.shape)}, dtype {op.tensor.dtype}"
+                    )
+                if len(expert_p2p_ops) > 5:
+                    logger.info(f"[TP{self.tp_rank}]   ... and {len(expert_p2p_ops) - 5} more expert ops")
+
+                logger.info(f"[TP{self.tp_rank}] PHASE 1 (legacy): Calling batch_isend_irecv for expert ops...")
+                reqs = batch_isend_irecv(expert_p2p_ops)
+                logger.info(f"[TP{self.tp_rank}] PHASE 1 (legacy): batch_isend_irecv returned {len(reqs)} requests, now waiting...")
+                for i, req in enumerate(reqs):
+                    if i % 100 == 0 or i < 5:  # Log first 5 and every 100th
+                        logger.info(f"[TP{self.tp_rank}] PHASE 1 (legacy): Waiting on expert request {i}/{len(reqs)}...")
+                    req.wait()
+                    if i % 100 == 0 or i < 5:
+                        logger.info(f"[TP{self.tp_rank}] PHASE 1 (legacy): Expert request {i} completed")
+                logger.info(f"[TP{self.tp_rank}] PHASE 1 (legacy): All expert recv ops completed, synchronizing...")
+                torch.cuda.synchronize()
+                logger.info(f"[TP{self.tp_rank}] PHASE 1 (legacy): Expert weights synchronized")
 
             # ========== PHASE 2: Non-Expert Weights (in sub-batches) ==========
             # Process non-expert weights in batches to match Tomni's batched sending.
@@ -1623,6 +1713,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 # Use transfer plan for batched processing
                 num_non_expert = len(non_expert_transfer_plan)
                 num_batches = (num_non_expert + non_expert_batch_size - 1) // non_expert_batch_size
+                logger.info(f"[TP{self.tp_rank}] PHASE 2: Processing {num_non_expert} non-expert weights in {num_batches} batches")
 
                 for batch_idx in range(num_batches):
                     start_idx = batch_idx * non_expert_batch_size
@@ -1646,18 +1737,38 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         ))
 
                     if batch_ops:
+                        logger.info(
+                            f"[TP{self.tp_rank}] PHASE 2: Non-expert batch {batch_idx+1}/{num_batches}, "
+                            f"{len(batch_ops)} ops, calling batch_isend_irecv..."
+                        )
                         reqs = batch_isend_irecv(batch_ops)
-                        for req in reqs:
+                        logger.info(f"[TP{self.tp_rank}] PHASE 2: batch_isend_irecv returned, waiting on {len(reqs)} requests...")
+                        for i, req in enumerate(reqs):
+                            if i % 10 == 0 or i < 3:  # Log first 3 and every 10th
+                                logger.info(f"[TP{self.tp_rank}] PHASE 2: Waiting on non-expert request {i}/{len(reqs)} (batch {batch_idx+1})...")
                             req.wait()
+                            if i % 10 == 0 or i < 3:
+                                logger.info(f"[TP{self.tp_rank}] PHASE 2: Non-expert request {i} completed (batch {batch_idx+1})")
+                        logger.info(f"[TP{self.tp_rank}] PHASE 2: Batch {batch_idx+1} complete, synchronizing...")
                         torch.cuda.synchronize()
+
+                logger.info(f"[TP{self.tp_rank}] PHASE 2: All non-expert batches complete")
 
             elif non_expert_p2p_ops:
                 # Legacy mode: process pre-built ops in a single batch
+                logger.info(f"[TP{self.tp_rank}] PHASE 2 (legacy): {len(non_expert_p2p_ops)} non-expert ops, calling batch_isend_irecv...")
                 reqs = batch_isend_irecv(non_expert_p2p_ops)
-                for req in reqs:
+                logger.info(f"[TP{self.tp_rank}] PHASE 2 (legacy): batch_isend_irecv returned, waiting on {len(reqs)} requests...")
+                for i, req in enumerate(reqs):
+                    if i % 10 == 0 or i < 3:
+                        logger.info(f"[TP{self.tp_rank}] PHASE 2 (legacy): Waiting on request {i}/{len(reqs)}...")
                     req.wait()
+                    if i % 10 == 0 or i < 3:
+                        logger.info(f"[TP{self.tp_rank}] PHASE 2 (legacy): Request {i} completed")
+                logger.info(f"[TP{self.tp_rank}] PHASE 2 (legacy): All ops complete, synchronizing...")
                 torch.cuda.synchronize()
 
+            logger.info(f"[TP{self.tp_rank}] ep_scatter_receive complete: Updated {updated_count} params")
             return True, f"Updated {updated_count} params in-place from {training_world_size} EP ranks (2-phase batched)"
 
         except Exception as e:
