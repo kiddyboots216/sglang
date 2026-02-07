@@ -1718,16 +1718,14 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         if recv_obj.input_token_logprobs_val is None:
             return
 
-        if (
-            len(recv_obj.input_token_logprobs_val) > 0
-            and recv_obj.input_token_logprobs_val[recv_obj_index] is not None
-        ):
-            state.input_token_logprobs_val.extend(
-                recv_obj.input_token_logprobs_val[recv_obj_index]
-            )
-            state.input_token_logprobs_idx.extend(
-                recv_obj.input_token_logprobs_idx[recv_obj_index]
-            )
+        if len(recv_obj.input_token_logprobs_val) > 0:
+            if recv_obj.input_token_logprobs_val[recv_obj_index]:
+                state.input_token_logprobs_val.extend(
+                    recv_obj.input_token_logprobs_val[recv_obj_index]
+                )
+                state.input_token_logprobs_idx.extend(
+                    recv_obj.input_token_logprobs_idx[recv_obj_index]
+                )
         state.output_token_logprobs_val.extend(
             recv_obj.output_token_logprobs_val[recv_obj_index]
         )

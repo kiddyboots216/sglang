@@ -167,7 +167,7 @@ NSA_CHOICES = [
 
 RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu"]
 
-RL_ON_POLICY_TARGET_CHOICES = ["fsdp"]
+RL_ON_POLICY_TARGET_CHOICES = ["fsdp", "tomni"]
 
 MOE_RUNNER_BACKEND_CHOICES = [
     "auto",
@@ -541,6 +541,7 @@ class ServerArgs:
     cuda_graph_max_bs: Optional[int] = None
     cuda_graph_bs: Optional[List[int]] = None
     disable_cuda_graph: bool = False
+    disable_draft_cuda_graph: bool = False
     disable_cuda_graph_padding: bool = False
     enable_profile_cuda_graph: bool = False
     enable_cudagraph_gc: bool = False
@@ -4098,6 +4099,11 @@ class ServerArgs:
             "--disable-cuda-graph",
             action="store_true",
             help="Disable cuda graph.",
+        )
+        parser.add_argument(
+            "--disable-draft-cuda-graph",
+            action="store_true",
+            help="Disable cuda graph for draft model in speculative decoding.",
         )
         parser.add_argument(
             "--disable-cuda-graph-padding",

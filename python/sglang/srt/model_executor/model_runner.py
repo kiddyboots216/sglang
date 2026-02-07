@@ -549,8 +549,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
             self.init_double_sparsity_channel_config(server_args.ds_heavy_channel_type)
 
-        # Enable batch invariant mode
-        if server_args.enable_deterministic_inference:
+        # Enable batch invariant mode (only needed for fsdp, not tomni)
+        if server_args.rl_on_policy_target == "fsdp":
             from sglang.srt.batch_invariant_ops import enable_batch_invariant_mode
 
             enable_batch_invariant_mode()
@@ -573,7 +573,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
 
         # Init routed experts capturer
-        self.init_routed_experts_capturer()
+        if not self.is_draft_worker:
+            self.init_routed_experts_capturer()
 
         if self.device == "cuda":
             self.init_cublas()
@@ -3172,11 +3173,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         output.expert_distribution_metrics = recorder_outputs.get("metrics")
 
         # Copy cached routing experts' buffers back to CPU cache
-        get_global_experts_capturer().on_forward_end(
-            forward_batch=forward_batch,
-            can_run_graph=output.can_run_graph,
-            cuda_graph_batch=getattr(self.graph_runner, "bs", None),
-        )
+        if not self.is_draft_worker:
+            get_global_experts_capturer().on_forward_end(
+                forward_batch=forward_batch,
+                can_run_graph=output.can_run_graph,
+                cuda_graph_batch=getattr(self.graph_runner, "bs", None),
+            )
 
         if self.eplb_manager is not None:
             self.eplb_manager.on_forward_pass_end()
