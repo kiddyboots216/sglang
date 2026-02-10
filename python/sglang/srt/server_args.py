@@ -167,7 +167,7 @@ NSA_CHOICES = [
 
 RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu"]
 
-RL_ON_POLICY_TARGET_CHOICES = ["fsdp", "tomni"]
+RL_ON_POLICY_TARGET_CHOICES = ["fsdp", "tomni", "tomni-batch-invariant"]
 
 MOE_RUNNER_BACKEND_CHOICES = [
     "auto",

@@ -549,8 +549,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
             self.init_double_sparsity_channel_config(server_args.ds_heavy_channel_type)
 
-        # Enable batch invariant mode (only needed for fsdp, not tomni)
-        if server_args.rl_on_policy_target == "fsdp":
+        # Enable batch invariant mode only for targets that need it (fsdp, tomni-batch-invariant)
+        if server_args.rl_on_policy_target in ("fsdp", "tomni-batch-invariant"):
             from sglang.srt.batch_invariant_ops import enable_batch_invariant_mode
 
             enable_batch_invariant_mode()
