@@ -1424,6 +1424,10 @@ class ReceiveWeightsEPScatterReqInput(BaseReq):
     non_expert_transfer_plan: Optional[List[Dict]] = None
     # Batch size for non-expert weight transfers (to avoid OOM by processing in chunks)
     non_expert_batch_size: int = 50
+    # Multi-endpoint support: rank offset for this endpoint in the global NCCL group
+    rank_offset: Optional[int] = None
+    # Total inference world size across all endpoints (for correct NCCL group init)
+    total_inference_world_size: Optional[int] = None
 
 
 @dataclass

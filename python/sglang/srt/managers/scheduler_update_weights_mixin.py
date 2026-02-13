@@ -311,6 +311,11 @@ class SchedulerUpdateWeightsMixin:
                 recv_req.group_name
             )
 
+            logger.info(
+                f"EP scatter receive: group_exists={group_exists}, group_name={recv_req.group_name}, "
+                f"rank_offset={recv_req.rank_offset}, total_inference_world_size={recv_req.total_inference_world_size}"
+            )
+
             if not group_exists:
                 # Need to initialize the group
                 if recv_req.master_address is None or recv_req.master_port is None:
@@ -329,13 +334,15 @@ class SchedulerUpdateWeightsMixin:
 
                 try:
                     # Initialize the group
-                    # For EP scatter: inference ranks are training_world_size to training_world_size+tp_size-1
-                    # rank_offset = training_world_size so that inference TP0 = global rank training_world_size
-                    total_world_size = recv_req.training_world_size + self.tp_size
+                    # For EP scatter: inference ranks start at rank_offset in the global NCCL group
+                    # With multiple endpoints, total world = training + ALL inference ranks (not just this endpoint)
+                    total_inference_ws = recv_req.total_inference_world_size if recv_req.total_inference_world_size is not None else self.tp_size
+                    total_world_size = recv_req.training_world_size + total_inference_ws
+                    rank_offset = recv_req.rank_offset if recv_req.rank_offset is not None else recv_req.training_world_size
                     init_success, init_msg = self.tp_worker.model_runner.init_weights_update_group(
                         master_address=recv_req.master_address,
                         master_port=recv_req.master_port,
-                        rank_offset=recv_req.training_world_size,  # Inference ranks start after training ranks
+                        rank_offset=rank_offset,
                         world_size=total_world_size,
                         group_name=recv_req.group_name,
                         backend="nccl",

@@ -1394,12 +1394,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         """
         from torch.distributed import P2POp, batch_isend_irecv
 
-        logger.debug(
+        logger.info(
             f"[TP{self.tp_rank}] ep_scatter_receive called: {len(weight_names)} weight_names, "
             f"training_world_size={training_world_size}, num_experts_per_rank={num_experts_per_rank}, "
             f"total_num_experts={total_num_experts}"
         )
-        logger.debug(
+        logger.info(
             f"[TP{self.tp_rank}] Transfer plans: expert_transfer_plan={len(expert_transfer_plan or [])} entries, "
             f"non_expert_transfer_plan={len(non_expert_transfer_plan or [])} entries"
         )
@@ -1637,7 +1637,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                                 break
 
                 num_layers = len(layer_transfers)
-                logger.debug(f"[TP{self.tp_rank}] PHASE 1: Processing {num_layers} expert layers (batched by layer)")
+                logger.info(f"[TP{self.tp_rank}] PHASE 1: Starting {num_layers} expert layers")
 
                 for layer_idx in sorted(layer_transfers.keys()):
                     layer_batch = layer_transfers[layer_idx]
@@ -1667,9 +1667,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         for req in reqs:
                             req.wait()
 
-                logger.debug(f"[TP{self.tp_rank}] PHASE 1: All {num_layers} expert layers received")
+                logger.info(f"[TP{self.tp_rank}] PHASE 1 complete, starting PHASE 2")
                 torch.cuda.synchronize()
-                logger.debug(f"[TP{self.tp_rank}] PHASE 1: Expert weights synchronized")
+                logger.info(f"[TP{self.tp_rank}] PHASE 1: Expert weights synchronized")
 
             elif expert_p2p_ops:
                 # Legacy mode: no transfer plan, use pre-built ops in a single batch
@@ -1687,7 +1687,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 # Use transfer plan for batched processing
                 num_non_expert = len(non_expert_transfer_plan)
                 num_batches = (num_non_expert + non_expert_batch_size - 1) // non_expert_batch_size
-                logger.debug(f"[TP{self.tp_rank}] PHASE 2: Processing {num_non_expert} non-expert weights in {num_batches} batches")
+                logger.info(f"[TP{self.tp_rank}] PHASE 2: Processing {num_non_expert} non-expert weights in {num_batches} batches")
 
                 for batch_idx in range(num_batches):
                     start_idx = batch_idx * non_expert_batch_size
@@ -1716,7 +1716,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                             req.wait()
                         torch.cuda.synchronize()
 
-                logger.debug(f"[TP{self.tp_rank}] PHASE 2: All non-expert batches complete")
+                logger.info(f"[TP{self.tp_rank}] PHASE 2: All non-expert batches complete")
 
             elif non_expert_p2p_ops:
                 # Legacy mode: process pre-built ops in a single batch
@@ -1726,7 +1726,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 logger.debug(f"[TP{self.tp_rank}] PHASE 2 (legacy): All ops complete, synchronizing...")
                 torch.cuda.synchronize()
 
-            logger.debug(f"[TP{self.tp_rank}] ep_scatter_receive complete: Updated {updated_count} params")
+            logger.info(f"[TP{self.tp_rank}] ep_scatter_receive complete: Updated {updated_count} params")
             return True, f"Updated {updated_count} params in-place from {training_world_size} EP ranks (2-phase batched)"
 
         except Exception as e:
